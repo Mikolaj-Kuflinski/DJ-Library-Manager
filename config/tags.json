@@ -1,0 +1,52 @@
+{
+  "EVENT": [
+    "18",
+    "40",
+    "50",
+    "Wesele"
+  ],
+  "MOOD": [
+    "Power",
+    "Sztosy",
+    "Taneczne",
+    "Śpiewanie",
+    "Chill",
+    "Vixa",
+    "Biesiada",
+    "Zabawy",
+    "Fanfary"
+  ],
+  "LANG": [
+    "PL",
+    "ENG",
+    "ES",
+    "IT"
+  ],
+  "ERA": [
+    "70s",
+    "80s",
+    "90s",
+    "00s",
+    "10s",
+    "20s"
+  ],
+  "GENRE": [
+    "POP",
+    "ROCK",
+    "METAL",
+    "JAZZ",
+    "K-POP",
+    "HOUSE",
+    "RAP",
+    "REGGAE"
+  ],
+  "TEMPO": [
+    "Wolne",
+    "Średnie",
+    "Szybkie"
+  ],
+  "SPECIAL": [
+    "Sax",
+    "Podkłady"
+  ]
+}

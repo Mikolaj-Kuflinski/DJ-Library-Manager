@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 
 from src.database_service import load_songs, update_song
 from src.tags import read_grouping, save_grouping
-from src.tag_panel import TagPanel
+from src.widgets.tag_panel import TagPanel
 
 
 class MainWindow(QWidget):

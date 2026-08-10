@@ -6,11 +6,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QLineEdit,
-    QMessageBox,
+    QAbstractItemView,
 )
 
 from src.database_service import load_songs, update_song
-from src.tags import read_grouping, save_grouping
+from src.tags import read_grouping, save_grouping, parse_grouping
 from src.widgets.tag_panel import TagPanel
 
 
@@ -38,21 +38,32 @@ class MainWindow(QWidget):
         self.search = QLineEdit()
         self.search.setPlaceholderText("🔍 Szukaj...")
         self.search.textChanged.connect(self.filter_songs)
-
         left.addWidget(self.search)
 
         self.counter = QLabel()
         left.addWidget(self.counter)
 
+        self.selected_counter = QLabel("Wybrano: 0 utworów")
+        left.addWidget(self.selected_counter)
+
         self.song_list = QListWidget()
+        self.song_list.setSelectionMode(
+            QAbstractItemView.ExtendedSelection
+        )
 
         for song in self.filtered_songs:
-            self.song_list.addItem(f"{song.artist}\n{song.title}")
+            self.song_list.addItem(
+                f"{song.artist}\n{song.title}"
+            )
 
-        self.song_list.currentRowChanged.connect(self.song_selected)
+        self.song_list.currentRowChanged.connect(
+            self.song_selected
+        )
+        self.song_list.itemSelectionChanged.connect(
+            self.selection_changed
+        )
 
         left.addWidget(self.song_list)
-
         main_layout.addLayout(left, 1)
 
         # ==================================
@@ -83,9 +94,7 @@ class MainWindow(QWidget):
         # ==================================
 
         self.tag_panel = TagPanel()
-
-        # przycisk zostaje jako ręczny zapis
-        self.tag_panel.save_button.clicked.connect(self.save_current_song)
+        self.tag_panel.tags_changed.connect(self.tags_changed)
 
         main_layout.addWidget(self.tag_panel, 2)
 
@@ -95,6 +104,8 @@ class MainWindow(QWidget):
             f"Znaleziono: {len(self.filtered_songs)} utworów"
         )
 
+        self.update_selected_counter()
+
         if self.filtered_songs:
             self.song_list.setCurrentRow(0)
 
@@ -103,21 +114,17 @@ class MainWindow(QWidget):
     def filter_songs(self, text):
 
         text = text.lower()
-
         self.filtered_songs = []
 
         self.song_list.blockSignals(True)
         self.song_list.clear()
 
         for song in self.songs:
-
             if (
                 text in song.title.lower()
                 or text in song.artist.lower()
             ):
-
                 self.filtered_songs.append(song)
-
                 self.song_list.addItem(
                     f"{song.artist}\n{song.title}"
                 )
@@ -128,17 +135,69 @@ class MainWindow(QWidget):
             f"Znaleziono: {len(self.filtered_songs)} utworów"
         )
 
+        self.update_selected_counter()
+
         if self.filtered_songs:
             self.song_list.setCurrentRow(0)
+        else:
+            self.current_song = None
+            self.current_grouping = ""
+            self.tag_panel.load_song("")
+
+    # =====================================================
+
+    def update_selected_counter(self):
+
+        count = len(self.song_list.selectedItems())
+
+        if count == 1:
+            text = "Wybrano: 1 utwór"
+        else:
+            text = f"Wybrano: {count} utworów"
+
+        self.selected_counter.setText(text)
+
+    # =====================================================
+
+    def get_selected_songs(self):
+
+        songs = []
+
+        for item in self.song_list.selectedItems():
+            row = self.song_list.row(item)
+
+            if 0 <= row < len(self.filtered_songs):
+                songs.append(self.filtered_songs[row])
+
+        return songs
+
+    # =====================================================
+
+    def selection_changed(self):
+
+        self.update_selected_counter()
+
+        selected_songs = self.get_selected_songs()
+
+        if not selected_songs:
+            return
+
+        if len(selected_songs) > 1:
+            self.tag_panel.load_songs(
+                [
+                    read_grouping(song.path)
+                    for song in selected_songs
+                ]
+            )
 
     # =====================================================
 
     def song_selected(self, index):
 
-        # AUTOZAPIS POPRZEDNIEGO
-        self.save_if_changed()
-
         if index < 0:
+            return
+
+        if index >= len(self.filtered_songs):
             return
 
         self.current_song = self.filtered_songs[index]
@@ -148,48 +207,73 @@ class MainWindow(QWidget):
         self.album.setText(self.current_song.album)
 
         grouping = read_grouping(self.current_song.path)
-
         self.current_grouping = grouping
 
-        self.tag_panel.load_song(grouping)
+        selected_songs = self.get_selected_songs()
+
+        if len(selected_songs) > 1:
+            self.tag_panel.load_songs(
+                [
+                    read_grouping(song.path)
+                    for song in selected_songs
+                ]
+            )
+        else:
+            self.tag_panel.load_song(grouping)
 
     # =====================================================
 
-    def save_if_changed(self):
+    def tags_changed(self):
 
-        if self.current_song is None:
+        selected_songs = self.get_selected_songs()
+
+        if not selected_songs:
             return
 
-        new_grouping = self.tag_panel.get_grouping()
+        changes = self.tag_panel.get_changes()
 
-        if new_grouping == self.current_grouping:
+        if not changes:
             return
 
-        save_grouping(
-            self.current_song.path,
-            self.tag_panel.get_tags()
+        for song in selected_songs:
+
+            song_tags = parse_grouping(
+                read_grouping(song.path)
+            )
+
+            for category, value, should_have in changes:
+
+                values = song_tags.setdefault(category, [])
+
+                if should_have:
+                    if value not in values:
+                        values.append(value)
+                else:
+                    if value in values:
+                        values.remove(value)
+
+            new_grouping = save_grouping(
+                song.path,
+                song_tags
+            )
+
+            song.grouping = new_grouping
+            update_song(song)
+
+        self.current_grouping = read_grouping(
+            self.current_song.path
         )
 
-        self.current_song.grouping = new_grouping
-
-        update_song(self.current_song)
-
-        self.current_grouping = new_grouping
-
-    # =====================================================
-
-    def save_current_song(self):
-
-        self.save_if_changed()
-
-        QMessageBox.information(
-            self,
-            "DJ Library Manager",
-            "Tagi zapisane."
+        self.tag_panel.set_baseline(
+            [
+                read_grouping(song.path)
+                for song in selected_songs
+            ]
         )
 
 
 def run_gui():
+
     app = QApplication([])
 
     window = MainWindow()

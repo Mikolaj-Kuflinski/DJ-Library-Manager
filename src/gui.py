@@ -7,7 +7,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
     QAbstractItemView,
+    QPushButton,
 )
+from PySide6.QtGui import QKeySequence, QShortcut
 
 from src.database_service import load_songs, update_song
 from src.tags import read_grouping, save_grouping, parse_grouping
@@ -26,6 +28,13 @@ class MainWindow(QWidget):
 
         self.current_song = None
         self.current_grouping = ""
+
+        # Historia operacji tagowania.
+        # Każda operacja zawiera stany wszystkich zmienionych utworów:
+        # (song, grouping_before, grouping_after)
+        self.undo_stack = []
+        self.redo_stack = []
+        self._history_busy = False
 
         main_layout = QHBoxLayout()
 
@@ -99,6 +108,41 @@ class MainWindow(QWidget):
         main_layout.addWidget(self.tag_panel, 2)
 
         self.setLayout(main_layout)
+
+        # ==================================
+        # SKRÓTY / PRZYCISKI UNDO REDO
+        # ==================================
+
+        undo_row = QHBoxLayout()
+
+        self.undo_button = QPushButton("↶ Cofnij")
+        self.redo_button = QPushButton("↷ Ponów")
+
+        self.undo_button.clicked.connect(self.undo)
+        self.redo_button.clicked.connect(self.redo)
+
+        undo_row.addWidget(self.undo_button)
+        undo_row.addWidget(self.redo_button)
+
+        # Przyciski są pod panelem tagów.
+        # TagPanel ma własny layout, więc dokładamy je do głównego
+        # layoutu po prawej stronie przez prosty wrapper.
+        # Na tym etapie pozostawiamy je jako część głównego layoutu.
+        main_layout.addLayout(undo_row)
+
+        self.undo_shortcut = QShortcut(
+            QKeySequence("Ctrl+Z"),
+            self
+        )
+        self.undo_shortcut.activated.connect(self.undo)
+
+        self.redo_shortcut = QShortcut(
+            QKeySequence("Ctrl+Shift+Z"),
+            self
+        )
+        self.redo_shortcut.activated.connect(self.redo)
+
+        self.update_history_buttons()
 
         self.counter.setText(
             f"Znaleziono: {len(self.filtered_songs)} utworów"
@@ -222,8 +266,13 @@ class MainWindow(QWidget):
             self.tag_panel.load_song(grouping)
 
     # =====================================================
+    # TAGI
+    # =====================================================
 
     def tags_changed(self):
+
+        if self._history_busy:
+            return
 
         selected_songs = self.get_selected_songs()
 
@@ -235,11 +284,13 @@ class MainWindow(QWidget):
         if not changes:
             return
 
+        history_entry = []
+
         for song in selected_songs:
 
-            song_tags = parse_grouping(
-                read_grouping(song.path)
-            )
+            before_grouping = read_grouping(song.path)
+
+            song_tags = parse_grouping(before_grouping)
 
             for category, value, should_have in changes:
 
@@ -252,13 +303,26 @@ class MainWindow(QWidget):
                     if value in values:
                         values.remove(value)
 
-            new_grouping = save_grouping(
+            after_grouping = save_grouping(
                 song.path,
                 song_tags
             )
 
-            song.grouping = new_grouping
+            song.grouping = after_grouping
             update_song(song)
+
+            history_entry.append(
+                (
+                    song,
+                    before_grouping,
+                    after_grouping,
+                )
+            )
+
+        if history_entry:
+            self.undo_stack.append(history_entry)
+            self.redo_stack.clear()
+            self.update_history_buttons()
 
         self.current_grouping = read_grouping(
             self.current_song.path
@@ -269,6 +333,110 @@ class MainWindow(QWidget):
                 read_grouping(song.path)
                 for song in selected_songs
             ]
+        )
+
+    # =====================================================
+    # HISTORIA
+    # =====================================================
+
+    def apply_history_entry(self, entry, use_after):
+
+        for song, before_grouping, after_grouping in entry:
+
+            grouping = (
+                after_grouping
+                if use_after
+                else before_grouping
+            )
+
+            tags = parse_grouping(grouping)
+
+            saved_grouping = save_grouping(
+                song.path,
+                tags
+            )
+
+            song.grouping = saved_grouping
+            update_song(song)
+
+    def refresh_after_history(self):
+
+        if self.current_song is None:
+            return
+
+        self.current_grouping = read_grouping(
+            self.current_song.path
+        )
+
+        selected_songs = self.get_selected_songs()
+
+        self._history_busy = True
+
+        try:
+            if len(selected_songs) > 1:
+                self.tag_panel.load_songs(
+                    [
+                        read_grouping(song.path)
+                        for song in selected_songs
+                    ]
+                )
+            else:
+                self.tag_panel.load_song(
+                    self.current_grouping
+                )
+        finally:
+            self._history_busy = False
+
+        self.update_history_buttons()
+
+    def undo(self):
+
+        if not self.undo_stack:
+            return
+
+        entry = self.undo_stack.pop()
+
+        self._history_busy = True
+
+        try:
+            self.apply_history_entry(
+                entry,
+                use_after=False
+            )
+            self.redo_stack.append(entry)
+        finally:
+            self._history_busy = False
+
+        self.refresh_after_history()
+
+    def redo(self):
+
+        if not self.redo_stack:
+            return
+
+        entry = self.redo_stack.pop()
+
+        self._history_busy = True
+
+        try:
+            self.apply_history_entry(
+                entry,
+                use_after=True
+            )
+            self.undo_stack.append(entry)
+        finally:
+            self._history_busy = False
+
+        self.refresh_after_history()
+
+    def update_history_buttons(self):
+
+        self.undo_button.setEnabled(
+            bool(self.undo_stack)
+        )
+
+        self.redo_button.setEnabled(
+            bool(self.redo_stack)
         )
 
 

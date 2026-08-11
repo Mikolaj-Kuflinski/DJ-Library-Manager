@@ -13,12 +13,8 @@ def scan_library(path):
         print("❌ Biblioteka nie istnieje.")
         return []
 
-    print("\nSkanowanie biblioteki...\n")
-
     songs = []
     files = list(library.rglob("*.mp3"))
-
-    print(f"Znaleziono {len(files)} plików.\n")
 
     for file in files:
         try:
@@ -39,14 +35,9 @@ def scan_library(path):
 
             songs.append(song)
 
-            print(f"🎵 {title}")
-            print(f"👤 {artist}")
-            print(f"💿 {album}")
-            print(f"🏷️ {grouping}")
-            print()
 
         except Exception:
-            print(file.name)
-            print()
+            # Pomijamy nieczytelne pliki bez zaśmiecania konsoli.
+            continue
 
     return songs

@@ -55,11 +55,14 @@ class MainWindow(QWidget):
         self.settings_tab = QWidget()
         self.tabs.addTab(self.library_tab, "🎵 Biblioteka")
         self.tabs.addTab(self.playlist_tab, "📋 Playlisty")
+        self.new_tracks_tab = QWidget()
+        self.tabs.addTab(self.new_tracks_tab, "🆕 Nowe utwory")
         self.tabs.addTab(self.settings_tab, "⚙ Ustawienia")
         main_layout.addWidget(self.tabs)
 
         self.build_library_tab()
         self.build_playlist_tab()
+        self.build_new_tracks_tab()
         self.build_settings_tab()
 
         undo_row = QHBoxLayout()
@@ -149,6 +152,370 @@ class MainWindow(QWidget):
         self.tag_panel.tags_changed.connect(self.tags_changed)
         layout.addWidget(self.tag_panel, 2)
 
+    # ==================== NOWE UTWORY ====================
+    def new_track_status_path(self):
+        return self.settings_file_path().parent / "new_tracks_status.json"
+
+    def new_track_session_path(self):
+        return self.settings_file_path().parent / "new_tracks_session.json"
+
+    def load_new_track_statuses(self):
+        self.new_track_statuses = {}
+        try:
+            path = self.new_track_status_path()
+            if path.exists():
+                import json
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self.new_track_statuses = {
+                        str(k): str(v) for k, v in data.items()
+                    }
+        except (OSError, ValueError, TypeError):
+            self.new_track_statuses = {}
+
+    def save_new_track_statuses(self):
+        try:
+            import json
+            path = self.new_track_status_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self.new_track_statuses, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def load_new_track_session(self):
+        self.new_track_session = set()
+        try:
+            path = self.new_track_session_path()
+            if path.exists():
+                import json
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    self.new_track_session = {str(Path(p).resolve()) for p in data}
+        except (OSError, ValueError, TypeError):
+            self.new_track_session = set()
+
+    def save_new_track_session(self):
+        try:
+            import json
+            path = self.new_track_session_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(sorted(self.new_track_session), ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def ensure_new_track_session(self):
+        if not hasattr(self, "new_track_statuses"):
+            self.load_new_track_statuses()
+        if not hasattr(self, "new_track_session"):
+            self.load_new_track_session()
+
+        current_paths = {
+            str(Path(song.path).resolve()) for song in self.songs
+        }
+
+        # Pierwsze uruchomienie po v0.8: każdy istniejący utwór bez statusu
+        # staje się nowym kandydatem. Później trafiają tu tylko nowe pliki.
+        for path in current_paths:
+            if path not in self.new_track_statuses:
+                self.new_track_statuses[path] = "new"
+                self.new_track_session.add(path)
+
+        # Utwory nadal niezatwierdzone pozostają w sesji.
+        for path, status in self.new_track_statuses.items():
+            if status in ("new", "todo") and path in current_paths:
+                self.new_track_session.add(path)
+
+        # Pliki usunięte z biblioteki znikają z bieżącej sesji i statusów.
+        self.new_track_session.intersection_update(current_paths)
+        self.new_track_statuses = {
+            path: status
+            for path, status in self.new_track_statuses.items()
+            if path in current_paths
+        }
+
+        self.save_new_track_statuses()
+        self.save_new_track_session()
+
+    def new_track_status_label(self, status):
+        return {
+            "new": "🆕 Nowe",
+            "tagged": "🏷️ Otagowane",
+            "todo": "⚠️ Do uzupełnienia",
+            "ready": "✅ Gotowe",
+        }.get(status, "🆕 Nowe")
+
+    def build_new_tracks_tab(self):
+        layout = QVBoxLayout(self.new_tracks_tab)
+
+        header = QHBoxLayout()
+        title = QLabel("🆕 Nowe utwory")
+        title.setStyleSheet("font-size:18px;font-weight:bold;")
+        header.addWidget(title)
+        header.addStretch()
+        self.new_tracks_count = QLabel("0 w sesji")
+        header.addWidget(self.new_tracks_count)
+        layout.addLayout(header)
+
+        info = QLabel(
+            "To jest Twoja kolejka pracy. Zmiany tagów zapisują się automatycznie. "
+            "Utwory zostają w tej sesji, dopóki ręcznie nie zakończysz pracy nad nimi."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        filters = QHBoxLayout()
+        self.new_tracks_status = QComboBox()
+        self.new_tracks_status.addItem("Wszystkie", "all")
+        self.new_tracks_status.addItem("🆕 Nowe", "new")
+        self.new_tracks_status.addItem("⚠️ Do uzupełnienia", "todo")
+        filters.addWidget(QLabel("Status:"))
+        filters.addWidget(self.new_tracks_status)
+
+        self.new_tracks_search = QLineEdit()
+        self.new_tracks_search.setPlaceholderText(
+            "Szukaj po tytule, artyście lub albumie…"
+        )
+        filters.addWidget(self.new_tracks_search, 1)
+        layout.addLayout(filters)
+
+        content = QHBoxLayout()
+
+        left = QVBoxLayout()
+        self.new_tracks_list = QListWidget()
+        self.new_tracks_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        left.addWidget(self.new_tracks_list)
+        content.addLayout(left, 2)
+
+        center = QVBoxLayout()
+        center.addWidget(QLabel("Tytuł"))
+        self.new_track_title = QLineEdit()
+        self.new_track_title.setReadOnly(True)
+        center.addWidget(self.new_track_title)
+
+        center.addWidget(QLabel("Artysta"))
+        self.new_track_artist = QLineEdit()
+        self.new_track_artist.setReadOnly(True)
+        center.addWidget(self.new_track_artist)
+
+        center.addWidget(QLabel("Album"))
+        self.new_track_album = QLineEdit()
+        self.new_track_album.setReadOnly(True)
+        center.addWidget(self.new_track_album)
+        center.addStretch()
+        content.addLayout(center, 1)
+
+        self.new_tracks_tag_panel = TagPanel()
+        self.new_tracks_tag_panel.tags_changed.connect(
+            self.new_tracks_tags_changed
+        )
+        content.addWidget(self.new_tracks_tag_panel, 2)
+
+        layout.addLayout(content, 1)
+
+        actions = QHBoxLayout()
+        self.new_tracks_finish_btn = QPushButton(
+            "✅ Zakończ pracę nad zaznaczonymi"
+        )
+        self.new_tracks_finish_btn.setEnabled(False)
+        actions.addWidget(self.new_tracks_finish_btn)
+
+        actions.addStretch()
+        self.new_tracks_refresh_btn = QPushButton("↻ Odśwież")
+        actions.addWidget(self.new_tracks_refresh_btn)
+        layout.addLayout(actions)
+
+        self.new_tracks_status.currentIndexChanged.connect(
+            self.refresh_new_tracks_tab
+        )
+        self.new_tracks_search.textChanged.connect(
+            self.refresh_new_tracks_tab
+        )
+        self.new_tracks_refresh_btn.clicked.connect(
+            self.refresh_new_tracks_tab
+        )
+        self.new_tracks_list.currentRowChanged.connect(
+            self.new_track_selected
+        )
+        self.new_tracks_list.itemSelectionChanged.connect(
+            self.update_new_tracks_actions
+        )
+        self.new_tracks_finish_btn.clicked.connect(
+            self.finish_selected_new_tracks
+        )
+
+        self.load_new_track_statuses()
+        self.load_new_track_session()
+        self.refresh_new_tracks_tab()
+
+    def refresh_new_tracks_tab(self):
+        if not hasattr(self, "new_tracks_list"):
+            return
+
+        self.ensure_new_track_session()
+        self.new_tracks_list.clear()
+
+        query = self.new_tracks_search.text().strip().lower()
+        selected_status = self.new_tracks_status.currentData()
+
+        session_songs = []
+        for song in self.songs:
+            path = str(Path(song.path).resolve())
+            if path in self.new_track_session:
+                session_songs.append(song)
+
+        for song in session_songs:
+            path = str(Path(song.path).resolve())
+            status = self.new_track_statuses.get(path, "new")
+
+            if selected_status != "all" and status != selected_status:
+                continue
+
+            title = getattr(song, "title", None) or Path(song.path).stem
+            artist = getattr(song, "artist", None) or ""
+            album = getattr(song, "album", None) or ""
+
+            if query and query not in f"{title} {artist} {album}".lower():
+                continue
+
+            item = QListWidgetItem(
+                f"{self.new_track_status_label(status)}  {title}"
+                + (f" — {artist}" if artist else "")
+            )
+            item.setData(Qt.UserRole, path)
+            self.new_tracks_list.addItem(item)
+
+        active_count = len(self.new_track_session)
+        self.new_tracks_count.setText(f"{active_count} w sesji")
+        self.update_new_tracks_actions()
+
+    def new_track_selected(self, index):
+        if index < 0 or index >= self.new_tracks_list.count():
+            self.new_track_title.clear()
+            self.new_track_artist.clear()
+            self.new_track_album.clear()
+            self.new_tracks_tag_panel.load_song("")
+            return
+
+        item = self.new_tracks_list.item(index)
+        path = item.data(Qt.UserRole)
+        song = self.song_by_path.get(path)
+
+        if song is None:
+            return
+
+        self.new_track_title.setText(
+            getattr(song, "title", None) or Path(song.path).stem
+        )
+        self.new_track_artist.setText(getattr(song, "artist", None) or "")
+        self.new_track_album.setText(getattr(song, "album", None) or "")
+
+        selected = self.get_selected_new_tracks()
+        if len(selected) > 1:
+            self.new_tracks_tag_panel.load_songs(
+                [read_grouping(s.path) for s in selected]
+            )
+        else:
+            self.new_tracks_tag_panel.load_song(
+                read_grouping(song.path)
+            )
+
+    def get_selected_new_tracks(self):
+        result = []
+        for item in self.new_tracks_list.selectedItems():
+            path = item.data(Qt.UserRole)
+            song = self.song_by_path.get(path)
+            if song is not None:
+                result.append(song)
+        return result
+
+    def new_tracks_tags_changed(self):
+        if self._history_busy:
+            return
+
+        selected = self.get_selected_new_tracks()
+        changes = self.new_tracks_tag_panel.get_changes()
+        if not selected or not changes:
+            return
+
+        entry = []
+        for song in selected:
+            before = read_grouping(song.path)
+            tags = parse_grouping(before)
+
+            for category, value, should_have in changes:
+                values = tags.setdefault(category, [])
+                if should_have and value not in values:
+                    values.append(value)
+                elif not should_have and value in values:
+                    values.remove(value)
+
+            after = save_grouping(song.path, tags)
+            song.grouping = after
+            update_song(song)
+            entry.append((song, before, after))
+
+        # Pierwsza jakakolwiek zmiana taga oznacza, że utwór został rozpoczęty.
+        # Status przechodzi automatycznie z 🆕 Nowe na ⚠️ Do dokończenia.
+        for song in selected:
+            path = str(Path(song.path).resolve())
+            if self.new_track_statuses.get(path) == "new":
+                self.new_track_statuses[path] = "todo"
+
+        self.save_new_track_statuses()
+        self.save_new_track_session()
+
+        # Aktualizujemy tylko tekst zaznaczonych pozycji w miejscu.
+        # Nie odświeżamy całej QListWidget, bo powodowałoby to utratę
+        # bieżącego wyboru i przeskok do kolejnego utworu podczas tagowania.
+        if hasattr(self, "new_tracks_list"):
+            for item in self.new_tracks_list.selectedItems():
+                path = item.data(Qt.UserRole)
+                if path:
+                    song = self.song_by_path.get(path)
+                    if song is not None:
+                        title = getattr(song, "title", None) or Path(song.path).stem
+                        artist = getattr(song, "artist", None) or ""
+                        item.setText(
+                            f"⚠️ Do dokończenia  {title}"
+                            + (f" — {artist}" if artist else "")
+                        )
+
+        # Autosave: tagi są zapisywane natychmiast. Do 🏷️ Otagowane przechodzimy
+        # dopiero po ręcznym zakończeniu pracy nad utworem.
+        self.undo_stack.append(("new_tags", entry))
+        self.redo_stack.clear()
+        self.update_history_buttons()
+        self.save_new_track_session()
+
+        if selected:
+            self.new_tracks_tag_panel.set_baseline(
+                [read_grouping(song.path) for song in selected]
+            )
+
+    def finish_selected_new_tracks(self):
+        selected = self.get_selected_new_tracks()
+        if not selected:
+            return
+
+        for song in selected:
+            path = str(Path(song.path).resolve())
+            self.new_track_statuses[path] = "tagged"
+            self.new_track_session.discard(path)
+
+        self.save_new_track_statuses()
+        self.save_new_track_session()
+        self.refresh_new_tracks_tab()
+
+    def update_new_tracks_actions(self):
+        enabled = bool(self.new_tracks_list.selectedItems())
+        self.new_tracks_finish_btn.setEnabled(enabled)
+
     # ==================== USTAWIENIA ====================
     def load_songs_from_source_folder(self):
         """Skanuje aktualnie wybrany folder źródłowy i zwraca jego utwory."""
@@ -200,6 +567,9 @@ class MainWindow(QWidget):
         if hasattr(self, "song_list"):
             self.update_filter_tag_options()
             self.apply_filters()
+
+        if hasattr(self, "new_tracks_list"):
+            self.refresh_new_tracks_tab()
 
         # Jeśli aktualnie wybrany utwór nadal istnieje w nowym źródle,
         # zachowaj go; w przeciwnym razie wyczyść panel szczegółów.
@@ -907,6 +1277,7 @@ class MainWindow(QWidget):
                 elif not should_have and value in values: values.remove(value)
             after=save_grouping(song.path,tags); song.grouping=after; update_song(song); entry.append((song,before,after))
         self.undo_stack.append(("tags",entry)); self.redo_stack.clear(); self.update_history_buttons()
+
         self.current_grouping=read_grouping(self.current_song.path); self.tag_panel.set_baseline([read_grouping(s.path) for s in selected])
 
     # ==================== UNDO / REDO ====================

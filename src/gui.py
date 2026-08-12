@@ -1,15 +1,18 @@
 from pathlib import Path
 import json
 import os
+import re
+import ctypes
+from datetime import datetime, timedelta
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QListWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QLineEdit, QAbstractItemView, QPushButton, QComboBox, QTabWidget,
     QInputDialog, QMessageBox, QFileDialog, QToolButton, QDialog, QDialogButtonBox, QListWidgetItem,
-    QFormLayout, QGroupBox,
+    QFormLayout, QGroupBox, QProgressBar, QTreeWidget, QTreeWidgetItem,
 )
-from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut, QDesktopServices
+from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QTimer, QUrl
 
 from src.database_service import load_songs, update_song
 from src.tags import read_grouping, save_grouping, parse_grouping
@@ -28,8 +31,17 @@ class MainWindow(QWidget):
         # Ustawienia muszą być wczytane przed biblioteką — folder źródłowy
         # decyduje o tym, jakie utwory trafiają do zakładki „Biblioteka”.
         self.load_app_settings()
+        self.spotify_errors = self.load_spotify_errors()
         self.songs = self.load_songs_from_source_folder()
-        self.song_by_path = {song.path: song for song in self.songs}
+
+        # Playlisty przechowują ścieżki, a Windows potrafi zwrócić tę samą
+        # ścieżkę w różnych postaciach (względna/absolutna, \ i /,
+        # różna wielkość liter). Trzymamy więc indeks po znormalizowanej
+        # ścieżce, żeby playlisty z tagów nie wyświetlały "Brak".
+        self.song_by_path = {}
+        for song in self.songs:
+            self.song_by_path[self._normalize_playlist_path(song.path)] = song
+
         self.filtered_songs = self.songs.copy()
         self.current_song = None
         self.current_grouping = ""
@@ -40,6 +52,8 @@ class MainWindow(QWidget):
 
         self.available_tags = get_available_tags()
         self.playlists = load_playlists()
+        self.playlist_folder_map = self.load_playlist_folder_map()
+        self.playlist_generated_map = self.load_playlist_generated_map()
         self.current_playlist_index = 0 if self.playlists else -1
 
         main_layout = QVBoxLayout(self)
@@ -52,17 +66,23 @@ class MainWindow(QWidget):
 
         self.library_tab = QWidget()
         self.playlist_tab = QWidget()
+        self.spotify_tab = QWidget()
+        self.error_book_tab = QWidget()
         self.settings_tab = QWidget()
         self.tabs.addTab(self.library_tab, "🎵 Biblioteka")
         self.tabs.addTab(self.playlist_tab, "📋 Playlisty")
+        self.tabs.addTab(self.spotify_tab, "🎵 Spotify")
         self.new_tracks_tab = QWidget()
         self.tabs.addTab(self.new_tracks_tab, "🆕 Nowe utwory")
+        self.tabs.addTab(self.error_book_tab, "📕 Błędy")
         self.tabs.addTab(self.settings_tab, "⚙ Ustawienia")
         main_layout.addWidget(self.tabs)
 
         self.build_library_tab()
         self.build_playlist_tab()
+        self.build_spotify_tab()
         self.build_new_tracks_tab()
+        self.build_error_book_tab()
         self.build_settings_tab()
 
         undo_row = QHBoxLayout()
@@ -90,6 +110,30 @@ class MainWindow(QWidget):
         self.update_filter_tag_options()
         self.apply_filters()
         self.refresh_playlist_list()
+
+    @staticmethod
+    def _normalize_playlist_path(path):
+        if not path:
+            return ""
+        try:
+            return os.path.normcase(os.path.normpath(str(Path(path).resolve())))
+        except Exception:
+            return os.path.normcase(os.path.normpath(str(path)))
+
+    def _find_song_for_playlist_path(self, path):
+        key = self._normalize_playlist_path(path)
+        song = self.song_by_path.get(key)
+        if song is not None:
+            return song
+
+        # Legacy playlists may contain the old, non-normalized path.
+        raw = str(path or "")
+        for candidate in self.songs:
+            if self._normalize_playlist_path(candidate.path) == key:
+                return candidate
+            if os.path.normcase(os.path.normpath(str(candidate.path))) == os.path.normcase(os.path.normpath(raw)):
+                return candidate
+        return None
 
     def dragged_over_tab(self, index):
         # Zakładka Playlisty ma indeks 1.
@@ -152,7 +196,1392 @@ class MainWindow(QWidget):
         self.tag_panel.tags_changed.connect(self.tags_changed)
         layout.addWidget(self.tag_panel, 2)
 
-    # ==================== NOWE UTWORY ====================
+    # ==================== SPOTIFY ====================
+    def build_spotify_tab(self):
+        layout = QVBoxLayout(self.spotify_tab)
+
+        title = QLabel("🎵 Spotify")
+        title.setStyleSheet("font-size:18px;font-weight:bold;")
+        layout.addWidget(title)
+
+        info = QLabel(
+            "Wklej link do utworu albo playlisty Spotify. "
+            "DJLM uruchomi lokalny spotDL i pobierze tylko brakujące pliki "
+            "do folderu wejściowego."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        form = QFormLayout()
+
+        self.spotify_url_edit = QLineEdit()
+        self.spotify_url_edit.setPlaceholderText(
+            "https://open.spotify.com/track/... lub /playlist/..."
+        )
+        form.addRow("🔗 Link Spotify:", self.spotify_url_edit)
+
+        self.spotify_download_folder = QLineEdit(
+            self.app_settings["source_folder"]
+        )
+        self.spotify_download_folder.setReadOnly(True)
+        form.addRow("📥 Folder pobierania:", self.spotify_download_folder)
+
+        cookie_row = QHBoxLayout()
+        self.spotify_cookie_file = QLineEdit(
+            self.app_settings.get("spotify_cookie_file", "")
+        )
+        self.spotify_cookie_file.setPlaceholderText(
+            "Opcjonalnie: ścieżka do cookies.txt z YouTube"
+        )
+        self.spotify_cookie_file.editingFinished.connect(
+            self.save_spotify_cookie_path
+        )
+        cookie_row.addWidget(self.spotify_cookie_file, 1)
+
+        self.spotify_cookie_browse_btn = QPushButton("📂 Wybierz")
+        self.spotify_cookie_browse_btn.clicked.connect(
+            self.choose_spotify_cookie_file
+        )
+        cookie_row.addWidget(self.spotify_cookie_browse_btn)
+
+        form.addRow("🍪 Cookies YouTube:", cookie_row)
+
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        self.spotify_download_btn = QPushButton("⬇️ Pobierz brakujące")
+        self.spotify_download_btn.clicked.connect(self.start_spotify_download)
+        buttons.addWidget(self.spotify_download_btn)
+
+        self.spotify_add_queue_btn = QPushButton("➕ Dodaj do kolejki")
+        self.spotify_add_queue_btn.clicked.connect(self.add_spotify_to_queue)
+        buttons.addWidget(self.spotify_add_queue_btn)
+
+        self.spotify_clear_btn = QPushButton("Wyczyść")
+        self.spotify_clear_btn.clicked.connect(self.spotify_url_edit.clear)
+        buttons.addWidget(self.spotify_clear_btn)
+
+        self.spotify_pause_btn = QPushButton("⏸ Wstrzymaj")
+        self.spotify_pause_btn.setEnabled(False)
+        self.spotify_pause_btn.clicked.connect(self.pause_spotify_download)
+        buttons.addWidget(self.spotify_pause_btn)
+
+        self.spotify_resume_btn = QPushButton("▶ Wznów")
+        self.spotify_resume_btn.setEnabled(False)
+        self.spotify_resume_btn.clicked.connect(self.resume_spotify_download)
+        buttons.addWidget(self.spotify_resume_btn)
+
+        self.spotify_cancel_btn = QPushButton("⛔ Anuluj")
+        self.spotify_cancel_btn.setEnabled(False)
+        self.spotify_cancel_btn.clicked.connect(self.confirm_cancel_spotify_download)
+        buttons.addWidget(self.spotify_cancel_btn)
+
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+        progress_row = QHBoxLayout()
+        self.spotify_progress = QLabel("Gotowy.")
+        progress_row.addWidget(self.spotify_progress, 1)
+
+        self.spotify_progress_bar = QProgressBar()
+        self.spotify_progress_bar.setRange(0, 100)
+        self.spotify_progress_bar.setValue(0)
+        self.spotify_progress_bar.setTextVisible(True)
+        self.spotify_progress_bar.setFormat("Pobrano 0/0")
+        progress_row.addWidget(self.spotify_progress_bar, 2)
+
+        self.spotify_progress_count = QLabel("Pobrano 0/0")
+        progress_row.addWidget(self.spotify_progress_count)
+        layout.addLayout(progress_row)
+
+        stats_row = QHBoxLayout()
+        self.spotify_speed_label = QLabel("🚀 Prędkość: —")
+        self.spotify_eta_label = QLabel("⏱️ ETA: —")
+        self.spotify_queue_btn = QPushButton("📋 Kolejka: 0(0)")
+        self.spotify_queue_btn.setFlat(True)
+        self.spotify_queue_btn.clicked.connect(self.toggle_spotify_queue)
+        stats_row.addWidget(self.spotify_speed_label)
+        stats_row.addWidget(self.spotify_eta_label)
+        stats_row.addWidget(self.spotify_queue_btn)
+        stats_row.addStretch()
+        layout.addLayout(stats_row)
+
+        self.spotify_queue_tree = QTreeWidget()
+        self.spotify_queue_tree.setHeaderHidden(True)
+        self.spotify_queue_tree.setMaximumHeight(260)
+        self.spotify_queue_tree.setVisible(False)
+        self.spotify_queue_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        layout.addWidget(self.spotify_queue_tree)
+
+        queue_actions = QHBoxLayout()
+        self.spotify_remove_queue_btn = QPushButton("🗑 Usuń z kolejki")
+        self.spotify_remove_queue_btn.setVisible(False)
+        self.spotify_remove_queue_btn.setEnabled(False)
+        self.spotify_remove_queue_btn.clicked.connect(
+            self.remove_selected_spotify_queue_item
+        )
+        queue_actions.addWidget(self.spotify_remove_queue_btn)
+        queue_actions.addStretch()
+        layout.addLayout(queue_actions)
+
+        self.spotify_queue_tree.itemSelectionChanged.connect(
+            self.update_spotify_queue_actions
+        )
+        self.spotify_queue_tree.itemClicked.connect(
+            self.spotify_queue_item_clicked
+        )
+
+        self.spotify_log = QListWidget()
+        self.spotify_log.setSelectionMode(QAbstractItemView.NoSelection)
+        layout.addWidget(self.spotify_log, 1)
+
+        error_row = QHBoxLayout()
+        self.spotify_errors_btn = QPushButton("📕 Książka błędów (0)")
+        self.spotify_errors_btn.clicked.connect(
+            lambda: self.tabs.setCurrentWidget(self.error_book_tab)
+        )
+        error_row.addWidget(self.spotify_errors_btn)
+        error_row.addStretch()
+        layout.addLayout(error_row)
+
+        self.spotify_download_total = 0
+        self.spotify_download_done = 0
+        self.spotify_download_started_at = None
+        self.spotify_current_track = ""
+        self.spotify_current_source_url = ""
+        self.spotify_queue = []
+        self.spotify_active_queue_index = -1
+        self.spotify_cancelled = False
+        self.spotify_start_after_metadata = False
+        self.spotify_active_error_count = 0
+        self.spotify_metadata_pending = []
+        self.spotify_metadata_current_url = None
+        self.spotify_metadata_output = bytearray()
+        self.spotify_last_download_bytes = 0
+        self.spotify_last_speed_time = None
+        self.spotify_last_speed_bytes = 0
+        self.spotify_current_track = ""
+
+        self.spotify_process = QProcess(self)
+        self.spotify_process.setProcessChannelMode(
+            QProcess.MergedChannels
+        )
+        self.spotify_process.readyReadStandardOutput.connect(
+            self.spotify_process_output
+        )
+        self.spotify_process.finished.connect(
+            self.spotify_download_finished
+        )
+
+        self.spotify_speed_timer = QTimer(self)
+        self.spotify_speed_timer.setInterval(1000)
+        self.spotify_speed_timer.timeout.connect(
+            self.update_spotify_speed
+        )
+        self.spotify_speed_last_bytes = 0
+        self.spotify_speed_last_time = None
+
+        self.spotify_metadata_process = QProcess(self)
+        self.spotify_metadata_process.setProcessChannelMode(
+            QProcess.MergedChannels
+        )
+        self.spotify_metadata_process.readyReadStandardOutput.connect(
+            self.spotify_metadata_output_ready
+        )
+        self.spotify_metadata_process.finished.connect(
+            self.spotify_metadata_finished
+        )
+
+    def save_spotify_cookie_path(self):
+        path = self.spotify_cookie_file.text().strip()
+        self.app_settings["spotify_cookie_file"] = path
+        self.save_app_settings()
+
+    def choose_spotify_cookie_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Wybierz plik cookies.txt",
+            str(Path.home()),
+            "Pliki cookies (*.txt);;Wszystkie pliki (*.*)",
+        )
+        if path:
+            path = str(Path(path).resolve())
+            self.spotify_cookie_file.setText(path)
+            self.app_settings["spotify_cookie_file"] = path
+            self.save_app_settings()
+
+    def _validate_spotify_url(self, url):
+        if not url:
+            QMessageBox.warning(
+                self, "Spotify",
+                "Wklej najpierw link do utworu albo playlisty Spotify."
+            )
+            return False
+        if "open.spotify.com/" not in url:
+            QMessageBox.warning(
+                self, "Spotify",
+                "To nie wygląda na link Spotify."
+            )
+            return False
+        return True
+
+    def _queue_label_from_url(self, url):
+        match = re.search(r"open\.spotify\.com/(playlist|album|track|artist)/([^?]+)", url)
+        if not match:
+            return "Spotify"
+        kind, ident = match.groups()
+        names = {
+            "playlist": "Playlist",
+            "album": "Album",
+            "track": "Utwór",
+            "artist": "Artysta",
+        }
+        return f"{names[kind]} {ident[:8]}"
+
+    def add_spotify_to_queue(self):
+        url = self.spotify_url_edit.text().strip()
+        if not self._validate_spotify_url(url):
+            return
+
+        if any(item["url"] == url for item in self.spotify_queue):
+            self.spotify_progress.setText("ℹ️ Ta pozycja jest już w kolejce.")
+            return
+
+        item = {
+            "url": url,
+            "name": self._queue_label_from_url(url),
+            "count": None,
+            "tracks": [],
+            "done": 0,
+            "status": "queued",
+        }
+        self.spotify_queue.append(item)
+        self.refresh_spotify_queue()
+        self.spotify_progress.setText(
+            f"➕ Dodano do kolejki: {item['name']}"
+        )
+        self.enqueue_spotify_metadata_resolution(url)
+
+    def enqueue_spotify_metadata_resolution(self, url):
+        if url not in self.spotify_metadata_pending:
+            self.spotify_metadata_pending.append(url)
+        self.start_next_spotify_metadata_resolution()
+
+    def start_next_spotify_metadata_resolution(self):
+        if self.spotify_metadata_process.state() != QProcess.NotRunning:
+            return
+        if not self.spotify_metadata_pending:
+            return
+
+        url = self.spotify_metadata_pending.pop(0)
+        self.spotify_metadata_current_url = url
+        self.spotify_metadata_output = bytearray()
+        self.spotify_metadata_process.start(
+            "spotdl",
+            ["save", url, "--save-file", "-"]
+        )
+
+    def spotify_metadata_output_ready(self):
+        self.spotify_metadata_output.extend(
+            bytes(self.spotify_metadata_process.readAllStandardOutput())
+        )
+
+    def _extract_spotify_tracks_from_metadata(self, payload):
+        tracks = []
+        seen = set()
+
+        def add_song(value):
+            if not isinstance(value, dict):
+                return
+
+            url = value.get("url")
+            if not (
+                isinstance(url, str)
+                and url.startswith("https://open.spotify.com/track/")
+            ):
+                return
+            if url in seen:
+                return
+
+            artists = value.get("artists") or value.get("artist") or []
+            if isinstance(artists, list):
+                names = []
+                for artist in artists:
+                    if isinstance(artist, dict):
+                        names.append(str(artist.get("name", "")))
+                    else:
+                        names.append(str(artist))
+                artist_text = ", ".join(x for x in names if x)
+            else:
+                artist_text = str(artists)
+
+            tracks.append({
+                "url": url,
+                "title": str(
+                    value.get("name")
+                    or value.get("title")
+                    or "Nieznany tytuł"
+                ),
+                "artist": artist_text or "Nieznany artysta",
+                "list_name": value.get("list_name"),
+                "list_url": value.get("list_url"),
+                "list_position": value.get("list_position"),
+                "list_length": value.get("list_length"),
+                "album_name": value.get("album_name"),
+            })
+            seen.add(url)
+
+        def walk(value):
+            if isinstance(value, dict):
+                add_song(value)
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk(payload)
+        return tracks
+
+    def _extract_collection_name(self, payload):
+        # `spotdl save ... --save-file -` returns a list of Song dictionaries.
+        # For playlist/album entries, list_name/list_url identify the actual
+        # Spotify collection name. This is more reliable than guessing from
+        # an album ID.
+        def walk(value):
+            if isinstance(value, dict):
+                name = value.get("list_name")
+                url = value.get("list_url")
+                if isinstance(name, str) and name.strip():
+                    return name.strip(), url
+                for child in value.values():
+                    found = walk(child)
+                    if found:
+                        return found
+            elif isinstance(value, list):
+                for child in value:
+                    found = walk(child)
+                    if found:
+                        return found
+            return None
+
+        return walk(payload)
+
+    def _spotify_match_key(self, value):
+        value = str(value or "").casefold()
+        value = re.sub(r"[^\w]+", " ", value, flags=re.UNICODE)
+        return " ".join(value.split())
+
+    def apply_spotify_playlist_tags(self, playlist_name, tracks):
+        """Assign downloaded/local songs to Spotify/<playlist> and persist the tag."""
+        playlist_name = str(playlist_name or "").strip()
+        if not playlist_name or not tracks:
+            return
+
+        # The metadata is normally available before the download starts, but
+        # the files are not in the library yet. Therefore this method is also
+        # called after spotDL finishes and the source folder has been rescanned.
+        try:
+            self.refresh_library_from_source_folder()
+        except Exception:
+            pass
+
+        by_artist_title = {}
+        by_title = {}
+        for song in self.songs:
+            artist_key = self._spotify_match_key(getattr(song, "artist", ""))
+            title_key = self._spotify_match_key(getattr(song, "title", ""))
+            if title_key:
+                by_title.setdefault(title_key, []).append(song)
+            if artist_key and title_key:
+                by_artist_title.setdefault(
+                    (artist_key, title_key), []
+                ).append(song)
+
+        matched = []
+        for track in tracks:
+            artist_key = self._spotify_match_key(track.get("artist", ""))
+            title_key = self._spotify_match_key(track.get("title", ""))
+            candidates = by_artist_title.get((artist_key, title_key), [])
+
+            # spotDL/Spotify can format featured artists differently. If an
+            # exact artist+title match fails, fall back to title-only when it
+            # identifies exactly one local song.
+            if not candidates and title_key:
+                candidates = by_title.get(title_key, [])
+                if len(candidates) > 1 and artist_key:
+                    narrowed = [
+                        s for s in candidates
+                        if artist_key in self._spotify_match_key(
+                            getattr(s, "artist", "")
+                        )
+                        or self._spotify_match_key(getattr(s, "artist", "")) in artist_key
+                    ]
+                    candidates = narrowed
+
+            for song in candidates:
+                if song not in matched:
+                    matched.append(song)
+
+        # Ensure Spotify is a real tag category and the playlist is generated
+        # in the dedicated Spotify folder.
+        self.playlist_folder_map.setdefault("__folders__", [])
+        if "Spotify" not in self.playlist_folder_map["__folders__"]:
+            self.playlist_folder_map["__folders__"].append("Spotify")
+
+        existing = {
+            p["name"].casefold(): p
+            for p in self.playlists
+        }
+        playlist = existing.get(playlist_name.casefold())
+        if playlist is None:
+            playlist = {"name": playlist_name, "paths": []}
+            self.playlists.append(playlist)
+
+        playlist["paths"] = [
+            self._normalize_playlist_path(song.path)
+            for song in matched
+        ]
+        self.playlist_folder_map[playlist["name"]] = "Spotify"
+        self.playlist_generated_map[playlist["name"]] = True
+
+        # Persist Spotify/<playlist> as an ordinary grouping category.
+        for song in matched:
+            try:
+                grouping = parse_grouping(read_grouping(song.path))
+            except Exception:
+                grouping = {}
+
+            values = grouping.get("Spotify", [])
+            if not isinstance(values, list):
+                values = [values] if values else []
+
+            if playlist_name not in values:
+                values.append(playlist_name)
+                grouping["Spotify"] = values
+                song.grouping = save_grouping(song.path, grouping)
+                update_song(song)
+
+        save_playlists(self.playlists)
+        self.save_playlist_folder_map()
+        self.save_playlist_generated_map()
+        if hasattr(self, "playlist_list"):
+            self.refresh_playlist_list()
+
+        self.spotify_progress.setText(
+            f"🏷️ Spotify → {playlist_name}: przypisano {len(matched)} utworów."
+        )
+
+    def spotify_metadata_finished(self, exit_code, exit_status):
+        url = self.spotify_metadata_current_url
+        output = bytes(self.spotify_metadata_output).decode(
+            "utf-8", errors="replace"
+        )
+        payload = None
+
+        # spotDL may print log lines before the JSON. Find the first valid
+        # JSON array/object.
+        for match in re.finditer(r"[\[{]", output):
+            try:
+                payload, _ = json.JSONDecoder().raw_decode(
+                    output[match.start():]
+                )
+                break
+            except json.JSONDecodeError:
+                continue
+
+        tracks = (
+            self._extract_spotify_tracks_from_metadata(payload)
+            if payload is not None else []
+        )
+        collection = (
+            self._extract_collection_name(payload)
+            if payload is not None else None
+        )
+
+        # Fallback: spotDL always logs "Found N songs in NAME (Playlist/Album)".
+        found_match = re.search(
+            r"Found\s+(\d+)\s+songs?\s+in\s+(.+?)\s+\((Playlist|Album)\)",
+            output,
+            re.IGNORECASE,
+        )
+        found_count = int(found_match.group(1)) if found_match else None
+        found_name = found_match.group(2).strip() if found_match else None
+        found_kind = found_match.group(3).lower() if found_match else ""
+
+        for item in self.spotify_queue:
+            if item["url"] != url:
+                continue
+
+            if tracks:
+                item["tracks"] = tracks
+                item["count"] = len(tracks)
+
+                # The exact Spotify collection name lives on each Song.
+                first = tracks[0]
+                exact_name = first.get("list_name")
+                exact_url = first.get("list_url")
+                if exact_name:
+                    item["name"] = exact_name
+                elif collection:
+                    item["name"] = collection[0]
+                if exact_url:
+                    item["resolved_url"] = exact_url
+
+                self.backfill_spotify_error_links(
+                    item.get("url", ""), tracks
+                )
+                # Tagowanie Spotify wykonujemy po zakończeniu pobierania,
+                # gdy nowe pliki są już obecne w Bibliotece.
+
+            if found_count is not None:
+                item["count"] = found_count
+            elif item.get("count") is None:
+                item["count"] = 1 if "/track/" in url else 0
+
+            if found_name:
+                item["name"] = found_name
+            break
+
+        self.refresh_spotify_queue()
+        self.start_next_spotify_metadata_resolution()
+
+    def toggle_spotify_queue(self):
+        visible = not self.spotify_queue_tree.isVisible()
+        self.spotify_queue_tree.setVisible(visible)
+        self.spotify_remove_queue_btn.setVisible(visible)
+        if visible:
+            self.refresh_spotify_queue()
+
+    def spotify_queue_item_clicked(self, item, column=0):
+        if item is None:
+            return
+        if item.data(0, Qt.UserRole) != "playlist":
+            return
+
+        index = item.data(0, Qt.UserRole + 1)
+        if not isinstance(index, int) or not (0 <= index < len(self.spotify_queue)):
+            return
+
+        queue_item = self.spotify_queue[index]
+        if not queue_item.get("tracks"):
+            # Metadata is only a UI enhancement; fetching it here never
+            # interrupts the active spotDL download.
+            self.enqueue_spotify_metadata_resolution(queue_item["url"])
+        else:
+            item.setExpanded(not item.isExpanded())
+
+    def backfill_spotify_error_links(self, queue_url, tracks):
+        if not queue_url or not tracks:
+            return
+
+        changed = False
+        for entry in self.spotify_errors:
+            if entry.get("queue_url") != queue_url:
+                continue
+            if entry.get("url", "").startswith("https://open.spotify.com/track/"):
+                continue
+
+            idx = entry.get("track_index")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(tracks):
+                continue
+
+            track = tracks[idx]
+            entry["url"] = track.get("url", "")
+            entry["artist"] = track.get("artist", entry.get("artist", "Nieznany artysta"))
+            entry["title"] = track.get("title", entry.get("title", "Nieznany tytuł"))
+            changed = True
+
+        if changed:
+            self.save_spotify_errors()
+            self.refresh_error_book()
+
+    def update_spotify_queue_actions(self):
+        item = self.spotify_queue_tree.currentItem()
+        can_remove = item is not None
+        if can_remove and item.data(0, Qt.UserRole) == "track":
+            can_remove = False
+        if can_remove and item.data(0, Qt.UserRole) == "playlist":
+            index = item.data(0, Qt.UserRole + 1)
+            can_remove = index != self.spotify_active_queue_index
+        self.spotify_remove_queue_btn.setEnabled(can_remove)
+
+    def remove_selected_spotify_queue_item(self):
+        item = self.spotify_queue_tree.currentItem()
+        if item is None:
+            return
+        if item.data(0, Qt.UserRole) != "playlist":
+            return
+
+        index = item.data(0, Qt.UserRole + 1)
+        if index == self.spotify_active_queue_index:
+            QMessageBox.information(
+                self,
+                "Kolejka",
+                "Nie można usunąć aktualnie pobieranej playlisty. "
+                "Najpierw anuluj jej pobieranie."
+            )
+            return
+
+        if not (0 <= index < len(self.spotify_queue)):
+            return
+
+        removed = self.spotify_queue.pop(index)
+        self.spotify_metadata_pending = [
+            u for u in self.spotify_metadata_pending
+            if u != removed.get("url")
+        ]
+
+        if self.spotify_active_queue_index > index:
+            self.spotify_active_queue_index -= 1
+
+        self.refresh_spotify_queue()
+        self.spotify_progress.setText(
+            f"🗑 Usunięto z kolejki: {removed.get('name', 'playlistę')}"
+        )
+
+    def refresh_spotify_queue(self):
+        if not hasattr(self, "spotify_queue_tree"):
+            return
+
+        self.spotify_queue_tree.clear()
+        current_remaining = 0
+        future_total = 0
+        future_unknown = 0
+
+        for index, item in enumerate(self.spotify_queue):
+            count = item.get("count")
+            remaining = max(0, (count or 0) - item.get("done", 0))
+
+            if index == self.spotify_active_queue_index:
+                current_remaining = remaining
+            elif index > self.spotify_active_queue_index:
+                if count is None:
+                    future_unknown += 1
+                else:
+                    future_total += remaining
+
+            if item.get("status") == "active":
+                prefix = "📥"
+            elif item.get("status") == "done":
+                prefix = "✅"
+            else:
+                prefix = "⏳"
+
+            count_text = "…" if count is None else str(remaining)
+            playlist_item = QTreeWidgetItem(
+                [f"{prefix} {item.get('name', 'Spotify')} ({count_text})"]
+            )
+            playlist_item.setToolTip(0, item.get("url", ""))
+            playlist_item.setChildIndicatorPolicy(
+                QTreeWidgetItem.ShowIndicator
+            )
+            playlist_item.setData(0, Qt.UserRole, "playlist")
+            playlist_item.setData(0, Qt.UserRole + 1, index)
+            self.spotify_queue_tree.addTopLevelItem(playlist_item)
+
+            for track in item.get("tracks", []):
+                pos = track.get("list_position")
+                pos_text = f"{pos}. " if pos else ""
+                track_item = QTreeWidgetItem([
+                    f"{pos_text}🎵 {track.get('artist', 'Nieznany artysta')} — "
+                    f"{track.get('title', 'Nieznany tytuł')}"
+                ])
+                track_item.setData(0, Qt.UserRole, "track")
+                track_item.setData(0, Qt.UserRole + 1, index)
+                track_item.setToolTip(0, track.get("url", ""))
+                playlist_item.addChild(track_item)
+
+        # Pokazujemy tylko liczbę utworów pozostałych w aktualnej
+        # playliście. Lista kolejek nadal jest dostępna po kliknięciu.
+        self.spotify_queue_btn.setText(
+            f"📋 Kolejka: {current_remaining}"
+        )
+        self.update_spotify_queue_actions()
+
+    def _start_next_spotify_queue_item(self):
+        if self.spotify_process.state() != QProcess.NotRunning:
+            return
+
+        next_index = None
+        for index, item in enumerate(self.spotify_queue):
+            if item.get("status") == "queued":
+                next_index = index
+                break
+
+        if next_index is None:
+            self.spotify_active_queue_index = -1
+            self.refresh_spotify_queue()
+            self.spotify_download_btn.setEnabled(True)
+            self.spotify_add_queue_btn.setEnabled(True)
+            return
+
+        item = self.spotify_queue[next_index]
+
+        # Metadata jest pomocnicze (nazwy, liczby i dokładne linki błędów).
+        # Nie może blokować właściwego pobierania.
+        if "/track/" not in item["url"] and not item.get("tracks"):
+            if item["url"] not in self.spotify_metadata_pending:
+                self.enqueue_spotify_metadata_resolution(item["url"])
+
+        self.spotify_active_queue_index = next_index
+        self.spotify_cancelled = False
+        self.spotify_active_error_count = 0
+        item["status"] = "active"
+        item["done"] = 0
+        self.spotify_current_source_url = item["url"]
+        self.spotify_current_track = ""
+        self.spotify_download_total = item.get("count") or 0
+        self.spotify_download_done = 0
+        self.spotify_download_started_at = datetime.now()
+        self.spotify_speed_last_bytes = self.source_folder_bytes()
+        self.spotify_speed_last_time = datetime.now()
+
+        self.spotify_log.clear()
+        self.spotify_progress.setText(
+            f"📥 Pobieranie: {item['name']}"
+        )
+        self.spotify_progress_bar.setRange(
+            0, self.spotify_download_total or 0
+        )
+        self.spotify_progress_bar.setValue(0)
+        self.spotify_progress_bar.setFormat(
+            f"Pobrano 0/{self.spotify_download_total or '—'}"
+        )
+        self.spotify_progress_count.setText(
+            f"Pobrano 0/{self.spotify_download_total or '—'}"
+        )
+        self.spotify_pause_btn.setEnabled(True)
+        self.spotify_resume_btn.setEnabled(False)
+        self.spotify_cancel_btn.setEnabled(True)
+        self.spotify_download_btn.setEnabled(False)
+        self.spotify_add_queue_btn.setEnabled(True)
+
+        folder = Path(self.app_settings["source_folder"])
+        output = str(folder / "{artists} - {title}.{output-ext}")
+
+        args = [
+            "download",
+            item["url"],
+            "--output", output,
+            "--format", "m4a",
+            "--bitrate", "disable",
+            "--overwrite", "skip",
+            "--scan-for-songs",
+        ]
+
+        cookie_file = self.spotify_cookie_file.text().strip()
+        if cookie_file:
+            self.app_settings["spotify_cookie_file"] = cookie_file
+            self.save_app_settings()
+            if not Path(cookie_file).is_file():
+                QMessageBox.warning(
+                    self, "Spotify",
+                    "Podany plik cookies nie istnieje."
+                )
+                item["status"] = "queued"
+                self.spotify_download_btn.setEnabled(True)
+                self.spotify_add_queue_btn.setEnabled(True)
+                self.refresh_spotify_queue()
+                return
+            args.extend(["--cookie-file", cookie_file])
+
+        self.spotify_speed_timer.start()
+
+        # spotDL runs as a Python console app. On Windows it can inherit the
+        # legacy cp1250 console encoding and crash on emoji/non-ASCII output.
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUTF8", "1")
+        env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("LC_ALL", "C.UTF-8")
+        env.insert("LANG", "C.UTF-8")
+        self.spotify_process.setProcessEnvironment(env)
+        self.spotify_process.start("spotdl", args)
+
+    def start_spotify_download(self):
+        url = self.spotify_url_edit.text().strip()
+        if not self._validate_spotify_url(url):
+            return
+
+        existing = next(
+            (i for i in self.spotify_queue if i["url"] == url),
+            None
+        )
+        if existing is None:
+            self.add_spotify_to_queue()
+
+        self._start_next_spotify_queue_item()
+
+    @staticmethod
+    def _format_bytes(value):
+        value = float(value)
+        for unit in ("B", "KiB", "MiB", "GiB"):
+            if abs(value) < 1024 or unit == "GiB":
+                return f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{value:.1f} GiB"
+
+    @staticmethod
+    def _format_duration(seconds):
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}min {seconds:02d}s"
+        return f"{minutes}min {seconds:02d}s"
+
+    def source_folder_bytes(self):
+        try:
+            root = Path(self.app_settings["source_folder"])
+            total = 0
+            for f in root.rglob("*"):
+                if f.is_file() and f.suffix.lower() in {
+                    ".mp3", ".m4a", ".mp4", ".flac", ".wav",
+                    ".aac", ".ogg", ".opus", ".wma", ".aiff",
+                }:
+                    try:
+                        total += f.stat().st_size
+                    except OSError:
+                        pass
+            return total
+        except OSError:
+            return 0
+
+    def update_spotify_speed(self):
+        if self.spotify_process.state() == QProcess.NotRunning:
+            return
+        now = datetime.now()
+        current_bytes = self.source_folder_bytes()
+        if self.spotify_speed_last_time:
+            elapsed = (now - self.spotify_speed_last_time).total_seconds()
+            if elapsed >= 0.8:
+                speed = max(0, current_bytes - self.spotify_speed_last_bytes) / elapsed
+                if speed > 0:
+                    self.spotify_speed_label.setText(
+                        f"🚀 Prędkość: {self._format_bytes(speed)}/s"
+                    )
+                    self.refresh_spotify_queue()
+                self.spotify_speed_last_bytes = current_bytes
+                self.spotify_speed_last_time = now
+
+    def spotify_process_output(self):
+        data = bytes(self.spotify_process.readAllStandardOutput())
+        if not data:
+            return
+
+        text = data.decode("utf-8", errors="replace")
+        for raw_line in text.splitlines():
+            line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw_line).strip()
+            if not line:
+                continue
+
+            # Nie pokazujemy linków YouTube/Spotify w logu. Zostawiamy
+            # komunikat o utworze, bo to jest dla użytkownika istotne.
+            urls = re.findall(r"https?://\S+", line)
+            if urls:
+                if "Processing query:" in line:
+                    self.spotify_current_source_url = urls[0].rstrip(")]>,")
+            cleaned = re.sub(r"https?://\S+", "", line).strip()
+            cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+            if not cleaned:
+                continue
+
+            # Czytelne oznaczenia statusu w logu:
+            # 📥 pobrano, ⏭️ pominięto istniejący, ❌ błąd.
+            if cleaned.startswith("Downloaded "):
+                display_line = "📥 " + cleaned
+            elif cleaned.startswith("Skipping "):
+                display_line = "⏭️ " + cleaned
+            elif (
+                "ERROR" in cleaned.upper()
+                or cleaned.startswith("Failed ")
+                or cleaned.startswith("Exception")
+                or cleaned.startswith("Unable to ")
+                or "could not" in cleaned.lower()
+            ):
+                display_line = "❌ " + cleaned
+                self.record_spotify_error(cleaned, line)
+            else:
+                display_line = cleaned
+
+            self.spotify_log.addItem(display_line)
+            self.spotify_log.scrollToBottom()
+
+            # Zachowujemy nazwę bieżącego utworu do podglądu kolejki.
+            if cleaned.startswith("Downloaded "):
+                self.spotify_current_track = cleaned[len("Downloaded "):].strip()
+            elif cleaned.startswith("Skipping "):
+                self.spotify_current_track = cleaned[len("Skipping "):].strip()
+            else:
+                quoted_track = re.search(r'"([^"]+\s-\s[^"]+)"', cleaned)
+                if quoted_track:
+                    self.spotify_current_track = quoted_track.group(1).strip()
+
+            # Próba odczytu postępu yt-dlp, np. "[download] 42.3% of 8.00MiB at 1.20MiB/s ETA 00:03".
+            progress_match = re.search(
+                r"(\d+(?:\.\d+)?)%.*?(?:(\d+(?:\.\d+)?)\s*(KiB|MiB|GiB)/s).*?(?:ETA\s+([0-9:]+))?",
+                cleaned,
+                re.IGNORECASE
+            )
+            if progress_match:
+                speed_value = float(progress_match.group(2))
+                speed_unit = progress_match.group(3).lower()
+                multiplier = {
+                    "kib": 1024,
+                    "mib": 1024 ** 2,
+                    "gib": 1024 ** 3,
+                }[speed_unit]
+                speed_bps = speed_value * multiplier
+                self.spotify_speed_label.setText(
+                    f"🚀 Prędkość: {self._format_bytes(speed_bps)}/s"
+                )
+                eta = progress_match.group(4)
+                if eta:
+                    self.spotify_eta_label.setText(f"⏱️ ETA: {eta}")
+
+            # spotDL wypisuje liczbę utworów podczas skanowania playlisty.
+            match = re.search(
+                r"(?:Found|found)\s+(\d+)\s+(?:songs|tracks)\s+in\s+(.+?)\s+\((Playlist|Album)\)",
+                cleaned
+            )
+            if match:
+                self.spotify_download_total = int(match.group(1))
+                if 0 <= self.spotify_active_queue_index < len(self.spotify_queue):
+                    active_item = self.spotify_queue[self.spotify_active_queue_index]
+                    active_item["count"] = self.spotify_download_total
+                    active_item["name"] = match.group(2).strip()
+                self.refresh_spotify_queue()
+            else:
+                count_only_match = re.search(
+                    r"(?:Found|found|Processing)\s+(\d+)\s+(?:songs|tracks)",
+                    cleaned
+                )
+                if count_only_match:
+                    self.spotify_download_total = int(count_only_match.group(1))
+                if self.spotify_download_total > 0:
+                    self.spotify_progress_bar.setRange(
+                        0, self.spotify_download_total
+                    )
+                    self.spotify_progress_bar.setValue(
+                        min(
+                            self.spotify_download_done,
+                            self.spotify_download_total
+                        )
+                    )
+                    self.spotify_progress_bar.setFormat(
+                        f"Pobrano {self.spotify_download_done}/"
+                        f"{self.spotify_download_total}"
+                    )
+                    self.spotify_progress_count.setText(
+                        f"Pobrano {self.spotify_download_done}/"
+                        f"{self.spotify_download_total}"
+                    )
+
+            completed = (
+                cleaned.startswith("Downloaded ")
+                or cleaned.startswith("Skipping ")
+            )
+            if completed:
+                self.spotify_download_done += 1
+
+                if self.spotify_download_total > 0:
+                    done = min(
+                        self.spotify_download_done,
+                        self.spotify_download_total
+                    )
+                    self.spotify_progress_bar.setRange(
+                        0, self.spotify_download_total
+                    )
+                    self.spotify_progress_bar.setValue(done)
+                    self.spotify_progress_bar.setFormat(
+                        f"Pobrano {done}/{self.spotify_download_total}"
+                    )
+                    self.spotify_progress_count.setText(
+                        f"Pobrano {done}/{self.spotify_download_total}"
+                    )
+                    remaining = max(
+                        0, self.spotify_download_total - done
+                    )
+                    if 0 <= self.spotify_active_queue_index < len(self.spotify_queue):
+                        active_item = self.spotify_queue[self.spotify_active_queue_index]
+                        active_item["done"] = done
+                    self.refresh_spotify_queue()
+                    if self.spotify_download_started_at and done:
+                        elapsed = (
+                            datetime.now() - self.spotify_download_started_at
+                        ).total_seconds()
+                        if elapsed > 0:
+                            per_item = elapsed / done
+                            remaining_seconds = int(
+                                per_item * remaining
+                            )
+                            self.spotify_eta_label.setText(
+                                f"⏱️ ETA: {self._format_duration(remaining_seconds)}"
+                            )
+                else:
+                    self.spotify_progress_bar.setFormat(
+                        f"Pobrano {self.spotify_download_done}/—"
+                    )
+                    self.spotify_progress_count.setText(
+                        f"Pobrano {self.spotify_download_done}/—"
+                    )
+
+    def _set_spotify_process_suspended(self, suspended):
+        if os.name != "nt":
+            return False
+
+        pid = int(self.spotify_process.processId())
+        if not pid:
+            return False
+
+        try:
+            ntdll = ctypes.WinDLL("ntdll")
+            handle = ctypes.windll.kernel32.OpenProcess(
+                0x0800 | 0x0400,  # PROCESS_SUSPEND_RESUME | PROCESS_QUERY_INFORMATION
+                False,
+                pid,
+            )
+            if not handle:
+                return False
+
+            try:
+                if suspended:
+                    status = ntdll.NtSuspendProcess(handle)
+                else:
+                    status = ntdll.NtResumeProcess(handle)
+                return status == 0
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except (AttributeError, OSError):
+            return False
+
+    def pause_spotify_download(self):
+        if self.spotify_process.state() == QProcess.NotRunning:
+            return
+
+        if self._set_spotify_process_suspended(True):
+            self.spotify_progress.setText("⏸ Pobieranie wstrzymane.")
+            self.spotify_pause_btn.setEnabled(False)
+            self.spotify_resume_btn.setEnabled(True)
+        else:
+            QMessageBox.warning(
+                self,
+                "Spotify",
+                "Nie udało się wstrzymać procesu spotDL."
+            )
+
+    def resume_spotify_download(self):
+        if self.spotify_process.state() == QProcess.NotRunning:
+            return
+
+        if self._set_spotify_process_suspended(False):
+            self.spotify_progress.setText("▶ Pobieranie wznowione…")
+            self.spotify_pause_btn.setEnabled(True)
+            self.spotify_resume_btn.setEnabled(False)
+        else:
+            QMessageBox.warning(
+                self,
+                "Spotify",
+                "Nie udało się wznowić procesu spotDL."
+            )
+
+    def confirm_cancel_spotify_download(self):
+        if self.spotify_process.state() == QProcess.NotRunning:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Anuluj pobieranie",
+            "Czy na pewno chcesz przerwać pobieranie?\n\n"
+            "Utwory już zapisane na dysku pozostaną na miejscu.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        self.cancel_spotify_download()
+
+    def cancel_spotify_download(self):
+        if self.spotify_process.state() == QProcess.NotRunning:
+            return
+
+        pid = int(self.spotify_process.processId())
+
+        # taskkill /T zatrzymuje także procesy potomne, np. yt-dlp uruchomione
+        # przez spotDL. Jest używane tylko po wyraźnym potwierdzeniu użytkownika.
+        if os.name == "nt" and pid:
+            try:
+                QProcess.execute(
+                    "taskkill",
+                    ["/PID", str(pid), "/T", "/F"]
+                )
+            except Exception:
+                self.spotify_process.kill()
+        else:
+            self.spotify_process.kill()
+
+        self.spotify_cancelled = True
+        self.spotify_progress.setText("⛔ Pobieranie anulowane.")
+        if 0 <= self.spotify_active_queue_index < len(self.spotify_queue):
+            self.spotify_queue[self.spotify_active_queue_index]["status"] = "queued"
+            self.refresh_spotify_queue()
+
+    def spotify_errors_file(self):
+        return self.settings_file_path().parent / "spotify_error_book.json"
+
+    def load_spotify_errors(self):
+        path = self.spotify_errors_file()
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return data if isinstance(data, list) else []
+        except (OSError, ValueError, TypeError):
+            pass
+        return []
+
+    def save_spotify_errors(self):
+        try:
+            self.spotify_errors_file().write_text(
+                json.dumps(self.spotify_errors, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def build_error_book_tab(self):
+        layout = QVBoxLayout(self.error_book_tab)
+
+        title = QLabel("📕 Książka błędów pobierania")
+        title.setStyleSheet("font-size:18px;font-weight:bold;")
+        layout.addWidget(title)
+
+        info = QLabel(
+            "Błędy są zapisywane między uruchomieniami DJLM. "
+            "Możesz wrócić do nich później i otworzyć link ręcznie."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.error_book_list = QListWidget()
+        layout.addWidget(self.error_book_list, 1)
+
+        buttons = QHBoxLayout()
+        self.error_open_btn = QPushButton("🌐 Otwórz link")
+        self.error_open_btn.clicked.connect(self.open_selected_error_link)
+        buttons.addWidget(self.error_open_btn)
+
+        self.error_copy_btn = QPushButton("📋 Kopiuj link")
+        self.error_copy_btn.clicked.connect(self.copy_selected_error_link)
+        buttons.addWidget(self.error_copy_btn)
+
+        self.error_remove_btn = QPushButton("🗑 Usuń wpis")
+        self.error_remove_btn.clicked.connect(self.remove_selected_error)
+        buttons.addWidget(self.error_remove_btn)
+
+        buttons.addStretch()
+        layout.addLayout(buttons)
+        self.refresh_error_book()
+
+    def refresh_error_book(self):
+        if not hasattr(self, "error_book_list"):
+            return
+        self.error_book_list.clear()
+        for e in self.spotify_errors:
+            self.error_book_list.addItem(
+                f"❌ {e.get('status','error (nie pobrano)')} | "
+                f"{e.get('artist','Nieznany artysta')} — "
+                f"{e.get('title','Nieznany tytuł')}\n"
+                f"🔗 {e.get('url','brak linku')}\n"
+                f"💬 {e.get('error','')}"
+            )
+        if hasattr(self, "spotify_errors_btn"):
+            self.spotify_errors_btn.setText(
+                f"📕 Książka błędów ({len(self.spotify_errors)})"
+            )
+
+    def selected_error(self):
+        if not hasattr(self, "error_book_list"):
+            return None
+        row = self.error_book_list.currentRow()
+        if 0 <= row < len(self.spotify_errors):
+            return self.spotify_errors[row]
+        return None
+
+    def open_selected_error_link(self):
+        entry = self.selected_error()
+        if entry and entry.get("url"):
+            QDesktopServices.openUrl(QUrl(entry["url"]))
+
+    def copy_selected_error_link(self):
+        entry = self.selected_error()
+        if entry and entry.get("url"):
+            QApplication.clipboard().setText(entry["url"])
+
+    def remove_selected_error(self):
+        row = self.error_book_list.currentRow()
+        if 0 <= row < len(self.spotify_errors):
+            self.spotify_errors.pop(row)
+            self.save_spotify_errors()
+            self.refresh_error_book()
+
+    def record_spotify_error(self, error_text, raw_line=""):
+        urls = re.findall(r"https?://\S+", raw_line)
+        url = urls[0].rstrip(")]>,") if urls else ""
+        if not url.startswith("https://open.spotify.com/track/"):
+            url = ""
+
+        title = "Nieznany tytuł"
+        artist = "Nieznany artysta"
+
+        quoted = re.search(r'"([^"]+)"', error_text)
+        label = quoted.group(1).strip() if quoted else ""
+        if " - " in label:
+            artist, title = label.split(" - ", 1)
+        elif label:
+            title = label
+        elif " - " in self.spotify_current_track:
+            artist, title = self.spotify_current_track.rsplit(" - ", 1)
+
+        active_item = (
+            self.spotify_queue[self.spotify_active_queue_index]
+            if 0 <= self.spotify_active_queue_index < len(self.spotify_queue)
+            else None
+        )
+        queue_url = active_item.get("url", "") if active_item else ""
+        track_index = None
+        if active_item:
+            tracks = active_item.get("tracks", [])
+            track_index = (
+                active_item.get("done", 0)
+                + self.spotify_active_error_count
+            )
+            title_norm = title.strip().casefold()
+            artist_norm = artist.strip().casefold()
+
+            for track in tracks:
+                if (
+                    track.get("title", "").strip().casefold() == title_norm
+                    and track.get("artist", "").strip().casefold() == artist_norm
+                ):
+                    url = track.get("url", "")
+                    break
+
+            if not url and self.spotify_current_track:
+                current_norm = self.spotify_current_track.casefold()
+                for track in tracks:
+                    label = (
+                        f"{track.get('artist','')} - "
+                        f"{track.get('title','')}"
+                    ).casefold()
+                    if label == current_norm:
+                        artist = track.get("artist", artist)
+                        title = track.get("title", title)
+                        url = track.get("url", "")
+                        break
+
+            # Jeśli spotDL nie poda nazwy utworu w komunikacie błędu,
+            # metadata playlisty pozwala wskazać konkretny track URL.
+            if not url and tracks and track_index is not None:
+                if track_index < len(tracks):
+                    track = tracks[track_index]
+                    artist = track.get("artist", artist)
+                    title = track.get("title", title)
+                    url = track.get("url", "")
+
+            self.spotify_active_error_count += 1
+
+        if not url and active_item and "/track/" in active_item.get("url", ""):
+            url = active_item["url"]
+
+        entry = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "status": "error (nie pobrano)",
+            "title": title.strip(),
+            "artist": artist.strip(),
+            "url": url,
+            "queue_url": queue_url,
+            "track_index": track_index,
+            "error": error_text,
+        }
+        self.spotify_errors.append(entry)
+        self.save_spotify_errors()
+        self.refresh_error_book()
+
+    def update_spotify_error_button(self):
+        self.refresh_error_book()
+
+    def spotify_download_finished(self, exit_code, exit_status):
+        self.spotify_speed_timer.stop()
+        self.spotify_pause_btn.setEnabled(False)
+        self.spotify_resume_btn.setEnabled(False)
+        self.spotify_cancel_btn.setEnabled(False)
+
+        active = (
+            self.spotify_queue[self.spotify_active_queue_index]
+            if 0 <= self.spotify_active_queue_index < len(self.spotify_queue)
+            else None
+        )
+
+        if exit_code == 0 and exit_status == QProcess.NormalExit:
+            self.spotify_eta_label.setText("⏱️ ETA: gotowe")
+            if self.spotify_download_total > 0:
+                self.spotify_progress_bar.setRange(
+                    0, self.spotify_download_total
+                )
+                self.spotify_progress_bar.setValue(
+                    self.spotify_download_total
+                )
+                self.spotify_progress_bar.setFormat(
+                    f"Pobrano {self.spotify_download_total}/"
+                    f"{self.spotify_download_total}"
+                )
+                self.spotify_progress_count.setText(
+                    f"Pobrano {self.spotify_download_total}/"
+                    f"{self.spotify_download_total}"
+                )
+
+            self.spotify_progress.setText(
+                "✅ Pobieranie zakończone. Skanuję bibliotekę…"
+            )
+            # Ponownie skanujemy folder wejściowy. Ta metoda aktualizuje
+            # Bibliotekę oraz sesję „Nowe utwory”, więc świeżo pobrane pliki
+            # dostają od razu status 🆕.
+            self.refresh_library_from_source_folder()
+
+            # Dopiero teraz lokalne pliki istnieją w bibliotece, więc możemy
+            # pewnie przypisać pobrane utwory do Spotify/<playlist>.
+            if active and active.get("tracks"):
+                self.apply_spotify_playlist_tags(
+                    active.get("name"),
+                    active.get("tracks", []),
+                )
+
+            self.refresh_new_tracks_tab()
+            self.spotify_progress.setText(
+                "✅ Gotowe — nowe pliki są dostępne w „Nowe utwory”."
+            )
+        else:
+            self.spotify_progress.setText(
+                f"❌ spotDL zakończył pracę z kodem {exit_code}."
+            )
+
+        if active:
+            if self.spotify_cancelled:
+                active["status"] = "queued"
+                self.refresh_spotify_queue()
+                self.spotify_download_btn.setEnabled(True)
+                self.spotify_add_queue_btn.setEnabled(True)
+                return
+
+            active["done"] = active.get("count") or self.spotify_download_done
+            active["status"] = "done"
+            self.refresh_spotify_queue()
+
+            # Kolejna playlista startuje automatycznie dopiero po pełnym
+            # zakończeniu procesu spotDL poprzedniej.
+            self._start_next_spotify_queue_item()
+
     def new_track_status_path(self):
         return self.settings_file_path().parent / "new_tracks_status.json"
 
@@ -353,6 +1782,18 @@ class MainWindow(QWidget):
         self.load_new_track_session()
         self.refresh_new_tracks_tab()
 
+    def update_new_tracks_badge(self):
+        if not hasattr(self, "new_tracks_tab"):
+            return
+        count = len(getattr(self, "new_track_session", set()))
+        tab_index = self.tabs.indexOf(self.new_tracks_tab)
+        if tab_index < 0:
+            return
+        if count > 0:
+            self.tabs.setTabText(tab_index, f"🆕 Nowe utwory  🟠 {count}")
+        else:
+            self.tabs.setTabText(tab_index, "🆕 Nowe utwory")
+
     def refresh_new_tracks_tab(self):
         if not hasattr(self, "new_tracks_list"):
             return
@@ -392,6 +1833,7 @@ class MainWindow(QWidget):
 
         active_count = len(self.new_track_session)
         self.new_tracks_count.setText(f"{active_count} w sesji")
+        self.update_new_tracks_badge()
         self.update_new_tracks_actions()
 
     def new_track_selected(self, index):
@@ -429,7 +1871,7 @@ class MainWindow(QWidget):
         result = []
         for item in self.new_tracks_list.selectedItems():
             path = item.data(Qt.UserRole)
-            song = self.song_by_path.get(path)
+            song = self._find_song_for_playlist_path(path)
             if song is not None:
                 result.append(song)
         return result
@@ -477,7 +1919,7 @@ class MainWindow(QWidget):
             for item in self.new_tracks_list.selectedItems():
                 path = item.data(Qt.UserRole)
                 if path:
-                    song = self.song_by_path.get(path)
+                    song = self._find_song_for_playlist_path(path)
                     if song is not None:
                         title = getattr(song, "title", None) or Path(song.path).stem
                         artist = getattr(song, "artist", None) or ""
@@ -515,6 +1957,43 @@ class MainWindow(QWidget):
     def update_new_tracks_actions(self):
         enabled = bool(self.new_tracks_list.selectedItems())
         self.new_tracks_finish_btn.setEnabled(enabled)
+
+    def playlist_metadata_file(self, name):
+        return self.settings_file_path().parent / name
+
+    def load_playlist_folder_map(self):
+        path = self.playlist_metadata_file("playlist_folders.json")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {"__folders__": []}
+        except (OSError, ValueError, TypeError):
+            return {"__folders__": []}
+
+    def save_playlist_folder_map(self):
+        try:
+            self.playlist_metadata_file("playlist_folders.json").write_text(
+                json.dumps(self.playlist_folder_map, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def load_playlist_generated_map(self):
+        path = self.playlist_metadata_file("playlist_generated.json")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def save_playlist_generated_map(self):
+        try:
+            self.playlist_metadata_file("playlist_generated.json").write_text(
+                json.dumps(self.playlist_generated_map, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except OSError:
+            pass
 
     # ==================== USTAWIENIA ====================
     def load_songs_from_source_folder(self):
@@ -598,6 +2077,7 @@ class MainWindow(QWidget):
         self.app_settings = {
             "source_folder": str(music_folder),
             "output_folder": str(default_output),
+            "spotify_cookie_file": "",
         }
 
         try:
@@ -729,9 +2209,29 @@ class MainWindow(QWidget):
 
         left = QVBoxLayout()
         left.addWidget(QLabel("Moje playlisty"))
-        self.playlist_list = PlaylistListWidget()
-        self.playlist_list.currentRowChanged.connect(self.playlist_selected)
-        self.playlist_list.songs_dropped.connect(self.add_paths_to_dropped_playlist)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("📁 Folder:"))
+        self.playlist_folder_filter = QComboBox()
+        self.playlist_folder_filter.currentIndexChanged.connect(
+            self.refresh_playlist_list
+        )
+        folder_row.addWidget(self.playlist_folder_filter, 1)
+        add_folder_btn = QPushButton("＋ Folder")
+        add_folder_btn.clicked.connect(self.create_playlist_folder)
+        folder_row.addWidget(add_folder_btn)
+        remove_folder_btn = QPushButton("🗑")
+        remove_folder_btn.setToolTip("Usuń folder (playlisty zostają)")
+        remove_folder_btn.clicked.connect(self.delete_playlist_folder)
+        folder_row.addWidget(remove_folder_btn)
+        left.addLayout(folder_row)
+
+        self.playlist_list = QTreeWidget()
+        self.playlist_list.setHeaderHidden(True)
+        self.playlist_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.playlist_list.setDragEnabled(False)
+        self.playlist_list.setAnimated(True)
+        self.playlist_list.itemClicked.connect(self.playlist_tree_item_clicked)
         left.addWidget(self.playlist_list)
 
         playlist_buttons = QHBoxLayout()
@@ -742,6 +2242,12 @@ class MainWindow(QWidget):
         rename_btn.clicked.connect(self.rename_playlist)
         delete_btn.clicked.connect(self.delete_playlist)
         playlist_buttons.addWidget(new_btn); playlist_buttons.addWidget(rename_btn); playlist_buttons.addWidget(delete_btn)
+        sync_tags_btn = QPushButton("🏷️ Playlisty z tagów")
+        sync_tags_btn.setToolTip(
+            "Utwórz/odśwież playlisty na podstawie kategorii i tagów"
+        )
+        sync_tags_btn.clicked.connect(self.sync_tag_playlists)
+        playlist_buttons.addWidget(sync_tags_btn)
         left.addLayout(playlist_buttons)
         layout.addLayout(left, 1)
 
@@ -775,19 +2281,282 @@ class MainWindow(QWidget):
         layout.addLayout(right, 1)
 
     def refresh_playlist_list(self):
+        if not hasattr(self, "playlist_list"):
+            return
+
+        current_folder = (
+            self.playlist_folder_filter.currentData()
+            if hasattr(self, "playlist_folder_filter")
+            else ""
+        )
+
+        # Folder list includes manually-created folders and folders inferred
+        # from tag categories.
+        folders = set(self.playlist_folder_map.get("__folders__", []))
+        for playlist in self.playlists:
+            folder = self.playlist_folder_map.get(playlist["name"], "")
+            if folder:
+                folders.add(folder)
+
+        self.playlist_folder_filter.blockSignals(True)
+        self.playlist_folder_filter.clear()
+        self.playlist_folder_filter.addItem("📁 Wszystkie foldery", "")
+        for folder in sorted(folders, key=str.casefold):
+            self.playlist_folder_filter.addItem(f"📁 {folder}", folder)
+        idx = self.playlist_folder_filter.findData(current_folder)
+        self.playlist_folder_filter.setCurrentIndex(idx if idx >= 0 else 0)
+        self.playlist_folder_filter.blockSignals(False)
+
         self.playlist_list.blockSignals(True)
         self.playlist_list.clear()
-        for playlist in self.playlists:
-            self.playlist_list.addItem(playlist["name"])
+
+        folder_items = {}
+
+        for index, playlist in enumerate(self.playlists):
+            folder = self.playlist_folder_map.get(playlist["name"], "")
+            if current_folder and folder != current_folder:
+                continue
+
+            generated = self.playlist_generated_map.get(playlist["name"], False)
+            if folder:
+                parent = folder_items.get(folder)
+                if parent is None:
+                    parent = QTreeWidgetItem([f"📁 {folder}"])
+                    parent.setData(0, Qt.ItemDataRole.UserRole, "folder")
+                    self.playlist_list.addTopLevelItem(parent)
+                    folder_items[folder] = parent
+            else:
+                parent = folder_items.get("__mine__")
+                if parent is None:
+                    parent = QTreeWidgetItem(["📁 Moje playlisty"])
+                    parent.setData(0, Qt.ItemDataRole.UserRole, "folder")
+                    self.playlist_list.addTopLevelItem(parent)
+                    folder_items["__mine__"] = parent
+
+            icon = "🏷️" if generated else "🎵"
+            child = QTreeWidgetItem([f"{icon} {playlist['name']}"])
+            child.setData(0, Qt.ItemDataRole.UserRole, "playlist")
+            child.setData(0, Qt.ItemDataRole.UserRole + 1, index)
+            parent.addChild(child)
+
+            if index == self.current_playlist_index:
+                self.playlist_list.setCurrentItem(child)
+                parent.setExpanded(True)
+
         self.playlist_list.blockSignals(False)
-        if 0 <= self.current_playlist_index < len(self.playlists):
-            self.playlist_list.setCurrentRow(self.current_playlist_index)
-        elif self.playlists:
-            self.current_playlist_index = 0
-            self.playlist_list.setCurrentRow(0)
-        else:
+
+        # Folder nodes are collapsed by default, except the selected one.
+        for i in range(self.playlist_list.topLevelItemCount()):
+            item = self.playlist_list.topLevelItem(i)
+            if item.data(0, Qt.ItemDataRole.UserRole) == "folder":
+                if item is not self.playlist_list.currentItem():
+                    item.setExpanded(
+                        any(
+                            item.child(j) is self.playlist_list.currentItem()
+                            for j in range(item.childCount())
+                        )
+                    )
+
+        if not (0 <= self.current_playlist_index < len(self.playlists)):
             self.current_playlist_index = -1
             self.refresh_playlist_contents()
+
+    def playlist_tree_item_clicked(self, item, column=0):
+        if item is None:
+            return
+        if item.data(0, Qt.ItemDataRole.UserRole) != "playlist":
+            item.setExpanded(not item.isExpanded())
+            return
+
+        index = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if isinstance(index, int) and 0 <= index < len(self.playlists):
+            self.current_playlist_index = index
+            self.refresh_playlist_contents()
+
+    def create_playlist_folder(self):
+        name, ok = QInputDialog.getText(
+            self, "Nowy folder playlist", "Nazwa folderu:"
+        )
+        name = name.strip()
+        if not ok or not name:
+            return
+        if name in self.playlist_folder_map.values():
+            QMessageBox.warning(self, "Foldery", "Taki folder już istnieje.")
+            return
+        # Folder is represented by a standalone entry in the metadata map.
+        self.playlist_folder_map.setdefault("__folders__", [])
+        if name not in self.playlist_folder_map["__folders__"]:
+            self.playlist_folder_map["__folders__"].append(name)
+        self.save_playlist_folder_map()
+        self.refresh_playlist_list()
+
+    def delete_playlist_folder(self):
+        folder = (
+            self.playlist_folder_filter.currentData()
+            if hasattr(self, "playlist_folder_filter")
+            else ""
+        )
+        if not folder:
+            return
+        answer = QMessageBox.question(
+            self, "Usuń folder",
+            f"Usunąć folder „{folder}”? Playlisty w nim pozostaną."
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        for name, value in list(self.playlist_folder_map.items()):
+            if value == folder:
+                self.playlist_folder_map[name] = ""
+        if folder in self.playlist_folder_map.get("__folders__", []):
+            self.playlist_folder_map["__folders__"].remove(folder)
+        self.save_playlist_folder_map()
+        self.refresh_playlist_list()
+
+    def normalize_tag_folder(self, category):
+        key = str(category).strip()
+        low = key.casefold()
+        if low in {"language", "languages", "lang", "język", "języki"}:
+            return "lang"
+        return re.sub(r"[^\w -]+", "", key, flags=re.UNICODE).strip().lower().replace(" ", "_")
+
+    def sync_tag_playlists_silent(self):
+        existing = {p["name"].casefold(): p for p in self.playlists}
+        changed = False
+        for song in self.songs:
+            tags = parse_grouping(read_grouping(song.path))
+            for category, values in tags.items():
+                folder = self.normalize_tag_folder(category)
+                for value in values:
+                    name = str(value).strip()
+                    if not name:
+                        continue
+                    playlist = existing.get(name.casefold())
+                    if playlist is None:
+                        playlist = {"name": name, "paths": []}
+                        self.playlists.append(playlist)
+                        existing[name.casefold()] = playlist
+                        changed = True
+                    if song.path not in playlist["paths"]:
+                        playlist["paths"].append(song.path)
+                        changed = True
+                    self.playlist_folder_map[name] = folder
+                    self.playlist_generated_map[name] = True
+        if changed:
+            save_playlists(self.playlists)
+        self.save_playlist_folder_map()
+        self.save_playlist_generated_map()
+        if hasattr(self, "playlist_list"):
+            self.refresh_playlist_list()
+
+    def sync_tag_playlists(self):
+        """Synchronize generated playlists from the library's tag grouping."""
+        # Build the desired membership from the actual tag data on disk.
+        desired = {}
+        desired_folders = {}
+
+        for song in self.songs:
+            raw = read_grouping(song.path)
+            try:
+                tags = parse_grouping(raw)
+            except Exception:
+                tags = {}
+
+            # Fallback to the cached grouping if parsing the file fails.
+            if not tags:
+                try:
+                    tags = parse_grouping(getattr(song, "grouping", "") or "")
+                except Exception:
+                    tags = {}
+
+            for category, values in tags.items():
+                if not isinstance(values, (list, tuple, set)):
+                    values = [values]
+
+                folder = self.normalize_tag_folder(category)
+                for value in values:
+                    name = str(value).strip()
+                    if not name:
+                        continue
+
+                    key = name.casefold()
+                    desired.setdefault(key, {
+                        "name": name,
+                        "paths": [],
+                        "folder": folder,
+                        "category": str(category),
+                    })
+                    normalized_path = self._normalize_playlist_path(song.path)
+                    if normalized_path not in desired[key]["paths"]:
+                        desired[key]["paths"].append(normalized_path)
+
+        for playlist in self.playlists:
+            if self.playlist_generated_map.get(playlist.get("name", ""), False):
+                playlist["paths"] = [
+                    self._normalize_playlist_path(path)
+                    for path in playlist.get("paths", [])
+                    if path
+                ]
+
+        # Generated playlists are identified by playlist_generated_map.
+        # User-created playlists are never deleted or overwritten.
+        generated_names = {
+            name.casefold()
+            for name, generated in self.playlist_generated_map.items()
+            if generated
+        }
+
+        by_name = {p["name"].casefold(): p for p in self.playlists}
+        changed = False
+
+        # Update/create generated playlists.
+        for key, wanted in desired.items():
+            playlist = by_name.get(key)
+            if playlist is None:
+                playlist = {
+                    "name": wanted["name"],
+                    "paths": list(wanted["paths"]),
+                }
+                self.playlists.append(playlist)
+                by_name[key] = playlist
+                changed = True
+            else:
+                if playlist.get("paths", []) != wanted["paths"] and (
+                    key in generated_names
+                ):
+                    playlist["paths"] = list(wanted["paths"])
+                    changed = True
+
+            self.playlist_folder_map[wanted["name"]] = wanted["folder"]
+            self.playlist_generated_map[wanted["name"]] = True
+
+        # Remove old memberships from generated playlists when tags were removed.
+        for playlist in self.playlists:
+            key = playlist["name"].casefold()
+            if key in generated_names and key not in desired:
+                if playlist.get("paths"):
+                    playlist["paths"] = []
+                    changed = True
+
+        # Ensure category folders exist in the folder list.
+        self.playlist_folder_map.setdefault("__folders__", [])
+        for wanted in desired.values():
+            folder = wanted["folder"]
+            if folder and folder not in self.playlist_folder_map["__folders__"]:
+                self.playlist_folder_map["__folders__"].append(folder)
+
+        if changed:
+            save_playlists(self.playlists)
+
+        self.save_playlist_folder_map()
+        self.save_playlist_generated_map()
+        self.refresh_playlist_list()
+
+        QMessageBox.information(
+            self,
+            "Playlisty z tagów",
+            f"Utworzono/zaktualizowano {len(desired)} playlist z tagów.\n\n"
+            "Language → folder „lang”; pozostałe kategorie → własne foldery."
+        )
 
     def refresh_playlist_contents(self):
         self.playlist_tracks.clear()
@@ -799,7 +2568,7 @@ class MainWindow(QWidget):
         self.playlist_title.setText(playlist["name"])
         valid_paths = []
         for path in playlist.get("paths", []):
-            song = self.song_by_path.get(path)
+            song = self._find_song_for_playlist_path(path)
             if not song:
                 continue
             item = self.playlist_tracks.item(self.playlist_tracks.count())
@@ -812,11 +2581,16 @@ class MainWindow(QWidget):
         self.playlist_info.setText(f"Nazwa: {playlist['name']}\nUtworów: {len(valid_paths)}")
 
     def playlist_selected(self, index):
-        if index < 0 or index >= len(self.playlists): return
-        self.current_playlist_index = index
-        self.refresh_playlist_contents()
-        if self.playlist_tracks.count() > 0:
-            self.playlist_tracks.setFocus()
+        # Kept for compatibility with older UI code.
+        if isinstance(index, int) and index >= 0:
+            visible = [
+                i for i, p in enumerate(self.playlists)
+                if not self.playlist_folder_filter.currentData()
+                or self.playlist_folder_map.get(p["name"], "") == self.playlist_folder_filter.currentData()
+            ]
+            if index < len(visible):
+                self.current_playlist_index = visible[index]
+                self.refresh_playlist_contents()
 
     def snapshot_playlists(self):
         return [{"name": p["name"], "paths": list(p.get("paths", []))} for p in self.playlists]
@@ -838,8 +2612,16 @@ class MainWindow(QWidget):
             return
         before = self.snapshot_playlists()
         self.playlists.append({"name": name, "paths": []})
+        selected_folder = (
+            self.playlist_folder_filter.currentData()
+            if hasattr(self, "playlist_folder_filter")
+            else ""
+        )
+        if selected_folder:
+            self.playlist_folder_map[name] = selected_folder
         self.current_playlist_index = len(self.playlists) - 1
         self.record_playlist_change(before)
+        self.save_playlist_folder_map()
         self.refresh_playlist_list()
 
     def rename_playlist(self):
@@ -853,7 +2635,14 @@ class MainWindow(QWidget):
             return
         before = self.snapshot_playlists()
         self.playlists[self.current_playlist_index]["name"] = name
+        old_folder = self.playlist_folder_map.pop(old, "")
+        if old_folder:
+            self.playlist_folder_map[name] = old_folder
+        if old in self.playlist_generated_map:
+            self.playlist_generated_map[name] = self.playlist_generated_map.pop(old)
         self.record_playlist_change(before)
+        self.save_playlist_folder_map()
+        self.save_playlist_generated_map()
         self.refresh_playlist_list()
 
     def delete_playlist(self):
@@ -863,8 +2652,12 @@ class MainWindow(QWidget):
         if answer != QMessageBox.StandardButton.Yes: return
         before = self.snapshot_playlists()
         del self.playlists[self.current_playlist_index]
+        self.playlist_folder_map.pop(name, None)
+        self.playlist_generated_map.pop(name, None)
         self.current_playlist_index = min(self.current_playlist_index, len(self.playlists)-1)
         self.record_playlist_change(before)
+        self.save_playlist_folder_map()
+        self.save_playlist_generated_map()
         self.refresh_playlist_list()
 
     def choose_playlists_for_selected(self):
@@ -1080,7 +2873,7 @@ class MainWindow(QWidget):
 
         import hashlib
         import plistlib
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta, timezone
         from urllib.parse import quote
 
         def pid(value):
@@ -1279,6 +3072,7 @@ class MainWindow(QWidget):
         self.undo_stack.append(("tags",entry)); self.redo_stack.clear(); self.update_history_buttons()
 
         self.current_grouping=read_grouping(self.current_song.path); self.tag_panel.set_baseline([read_grouping(s.path) for s in selected])
+        self.sync_tag_playlists_silent()
 
     # ==================== UNDO / REDO ====================
     def restore_playlist_snapshot(self, snapshot):

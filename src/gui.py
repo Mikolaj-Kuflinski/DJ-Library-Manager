@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QKeySequence, QShortcut, QDesktopServices
 from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QTimer, QUrl
+from PySide6.QtMultimedia import QMediaPlayer
 
 from src.database_service import load_songs, update_song
 from src.tags import read_grouping, save_grouping, parse_grouping
@@ -39,6 +40,8 @@ from src.services.library_service import LibraryService
 from src.services.error_book_service import ErrorBookService
 from src.services.spotify_metadata_service import SpotifyMetadataService
 from src.services.spotify_queue_service import SpotifyQueueService
+from src.services.audio_player_service import AudioPlayerService
+from src.widgets.player_widget import PlayerWidget
 
 
 class MainWindow(QWidget):
@@ -63,6 +66,10 @@ class MainWindow(QWidget):
         self.error_book_service = ErrorBookService(self.settings_service)
         self.spotify_metadata_service = SpotifyMetadataService()
         self.spotify_queue_service = SpotifyQueueService()
+        self.audio_player_service = AudioPlayerService(self)
+        self.audio_player_service.player.mediaStatusChanged.connect(
+            self._player_media_status_changed
+        )
         self.load_app_settings()
         self.spotify_errors = self.load_spotify_errors()
         self.songs = self.load_songs_from_source_folder()
@@ -111,6 +118,15 @@ class MainWindow(QWidget):
         self.tabs.addTab(self.settings_tab, "⚙ Ustawienia")
         main_layout.addWidget(self.tabs)
 
+        self.player_widget = PlayerWidget(
+            self.audio_player_service,
+            self,
+        )
+        self.player_widget.set_skip_seconds(
+            self.app_settings.get("player_skip_seconds", 5)
+        )
+        main_layout.addWidget(self.player_widget)
+
         self.build_library_tab()
         self.build_playlist_tab()
         self.build_spotify_tab()
@@ -127,6 +143,39 @@ class MainWindow(QWidget):
         undo_row.addWidget(self.redo_button)
         undo_row.addStretch()
         main_layout.addLayout(undo_row)
+
+        self.player_space_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_Space),
+            self,
+        )
+        self.player_space_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.player_space_shortcut.activated.connect(
+            self.audio_player_service.toggle
+        )
+
+        self.player_left_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_Left),
+            self,
+        )
+        self.player_left_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.player_left_shortcut.activated.connect(
+            self.player_widget.skip_backward
+        )
+
+        self.player_right_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_Right),
+            self,
+        )
+        self.player_right_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.player_right_shortcut.activated.connect(
+            self.player_widget.skip_forward
+        )
 
         self.undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
         self.undo_shortcut.activated.connect(self.undo)
@@ -187,6 +236,9 @@ class MainWindow(QWidget):
         self.tag_filter.currentIndexChanged.connect(self.apply_filters)
         self.clear_filters_button.clicked.connect(self.clear_filters)
         self.song_list.currentRowChanged.connect(self.song_selected)
+        self.song_list.itemDoubleClicked.connect(
+            lambda _item: self.play_current_song()
+        )
         self.song_list.itemSelectionChanged.connect(self.selection_changed)
         self.add_to_playlist_button.clicked.connect(
             self.choose_playlists_for_selected
@@ -1390,6 +1442,9 @@ class MainWindow(QWidget):
         self.new_tracks_list.currentRowChanged.connect(
             self.new_track_selected
         )
+        self.new_tracks_list.itemDoubleClicked.connect(
+            self.play_new_track
+        )
         self.new_tracks_list.itemSelectionChanged.connect(
             self.update_new_tracks_actions
         )
@@ -1681,6 +1736,9 @@ class MainWindow(QWidget):
         self.settings_widget.source_folder_changed.connect(
             self._settings_source_folder_changed
         )
+        self.settings_widget.player_skip_changed.connect(
+            self.player_widget.set_skip_seconds
+        )
         layout.addWidget(self.settings_widget)
 
     def _settings_source_folder_changed(self, folder):
@@ -1753,6 +1811,9 @@ class MainWindow(QWidget):
         )
         self.playlist_tracks.songs_dropped.connect(
             self.add_paths_to_current_playlist
+        )
+        self.playlist_tracks.itemDoubleClicked.connect(
+            self.play_playlist_track
         )
         self.playlist_tracks.order_changed.connect(
             self.playlist_order_changed
@@ -2294,57 +2355,25 @@ class MainWindow(QWidget):
         source_folder = (source_folder or "").strip().strip("/")
         target_folder = (target_folder or "").strip().strip("/")
 
-        # Capture the tree state explicitly before changing the model.
-        expanded = set()
-        for i in range(self.playlist_list.topLevelItemCount()):
-            stack = [self.playlist_list.topLevelItem(i)]
-            while stack:
-                item = stack.pop()
-                if item.data(0, Qt.ItemDataRole.UserRole) == "folder":
-                    path = item.data(
-                        0, Qt.ItemDataRole.UserRole + 2
-                    ) or ""
-                    if path and item.isExpanded():
-                        expanded.add(path)
-                for j in range(item.childCount()):
-                    stack.append(item.child(j))
-
-        # Always keep the source branch open after the operation.
-        if source_folder:
-            parts = [p for p in source_folder.split("/") if p]
-            expanded.update(
-                "/".join(parts[:i])
-                for i in range(1, len(parts) + 1)
-            )
-        if target_folder:
-            parts = [p for p in target_folder.split("/") if p]
-            expanded.update(
-                "/".join(parts[:i])
-                for i in range(1, len(parts) + 1)
-            )
-
+        before = self.snapshot_playlists()
         memberships = self.playlist_folders_for(name)
 
         if action == "copy":
-            # COPY: do not touch the source membership at all.
-            if target_folder and target_folder not in memberships:
-                memberships = list(memberships)
-                memberships.append(target_folder)
-                self.set_playlist_folders(name, memberships)
-            elif not target_folder and not memberships:
-                self.set_playlist_folders(name, [""])
-            else:
+            # COPY means exactly that: keep the source membership and add
+            # the target membership. Never remove source_folder.
+            if target_folder in memberships:
                 return
+            memberships.append(target_folder)
+            self.set_playlist_folders(name, memberships)
+
         else:
-            # MOVE: remove only the membership represented by the dragged
-            # tree item, then add the destination.
+            # MOVE removes only the membership represented by the tree item.
             memberships = [
                 folder for folder in memberships
                 if folder != source_folder
             ]
-            if target_folder:
-                if target_folder not in memberships:
-                    memberships.append(target_folder)
+            if target_folder not in memberships:
+                memberships.append(target_folder)
             self.set_playlist_folders(name, memberships)
 
         self.playlist_folder_map.setdefault("__folders__", [])
@@ -2354,13 +2383,11 @@ class MainWindow(QWidget):
         ):
             self.playlist_folder_map["__folders__"].append(target_folder)
 
-        # Persist the folder relationship immediately. Folder membership is
-        # metadata, not playlist content, so don't route COPY through the
-        # playlist-content history mechanism.
-        self.save_playlist_folder_map()
-
-        if action == "move" and source_folder == target_folder:
-            # Reorder only when moving inside the same folder.
+        # Only a MOVE within the same folder changes ordering.
+        if (
+            action == "move"
+            and source_folder == target_folder
+        ):
             playlist = self.playlists.pop(source_index)
             target_position = max(0, int(target_position))
 
@@ -2384,45 +2411,10 @@ class MainWindow(QWidget):
 
             self.playlists.insert(insert_at, playlist)
             self.current_playlist_index = insert_at
-            self.playlist_storage_service.save(self.playlists)
 
-        # Give refresh an explicit expansion snapshot. This is stronger than
-        # relying on Qt's state after a drag operation.
-        self.playlist_list._expanded_before_drag = expanded
+        self.record_playlist_change(before)
+        self.save_playlist_folder_map()
         self.refresh_playlist_list()
-
-        # Final defensive restore, because this operation is user-facing and
-        # should never collapse the source/target branches.
-        for path in expanded:
-            item = None
-            parts = [p for p in path.split("/") if p]
-            if not parts:
-                continue
-
-            # Find the tree node by its stored full path.
-            stack = [
-                self.playlist_list.topLevelItem(i)
-                for i in range(self.playlist_list.topLevelItemCount())
-            ]
-            while stack and item is None:
-                candidate = stack.pop()
-                if (
-                    candidate.data(
-                        0, Qt.ItemDataRole.UserRole
-                    ) == "folder"
-                    and (
-                        candidate.data(
-                            0, Qt.ItemDataRole.UserRole + 2
-                        ) or ""
-                    ) == path
-                ):
-                    item = candidate
-                    break
-                for j in range(candidate.childCount()):
-                    stack.append(candidate.child(j))
-
-            if item is not None:
-                item.setExpanded(True)
 
     def create_playlist(self):
         name, ok = QInputDialog.getText(
@@ -2821,6 +2813,51 @@ class MainWindow(QWidget):
         self.current_grouping=read_grouping(self.current_song.path); selected=self.get_selected_songs()
         if len(selected)>1: self.tag_panel.load_songs([self.tag_service.read_grouping(s.path) for s in selected])
         else: self.tag_panel.load_song(self.current_grouping)
+
+    # ==================== ODTWARZACZ ====================
+    def _player_media_status_changed(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.play_next_song()
+
+    def play_song(self, song):
+        if song is None:
+            return
+        if self.audio_player_service.load(song.path):
+            self.player_widget.set_track(song.artist, song.title)
+            self.audio_player_service.play()
+
+    def play_current_song(self):
+        self.play_song(self.current_song)
+
+    def play_playlist_track(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        song = self._find_song_for_playlist_path(path)
+        self.play_song(song)
+
+    def play_new_track(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        song = self._find_song_for_playlist_path(path)
+        self.play_song(song)
+
+    def play_previous_song(self):
+        if not self.filtered_songs:
+            return
+        current_index = self.song_list.currentRow()
+        target = current_index - 1
+        if target < 0:
+            target = len(self.filtered_songs) - 1
+        self.song_list.setCurrentRow(target)
+        self.play_current_song()
+
+    def play_next_song(self):
+        if not self.filtered_songs:
+            return
+        current_index = self.song_list.currentRow()
+        target = current_index + 1
+        if target >= len(self.filtered_songs):
+            target = 0
+        self.song_list.setCurrentRow(target)
+        self.play_current_song()
 
     def tags_changed(self):
         if self._history_busy:

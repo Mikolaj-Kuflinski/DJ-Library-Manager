@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QComboBox,
     QLineEdit,
     QPushButton,
     QVBoxLayout,
@@ -18,6 +19,7 @@ class SettingsWidget(QWidget):
     """Settings UI; persistence is handled by SettingsService."""
 
     source_folder_changed = Signal(str)
+    player_skip_changed = Signal(int)
 
     def __init__(self, settings, settings_service, parent=None):
         super().__init__(parent)
@@ -55,6 +57,22 @@ class SettingsWidget(QWidget):
 
         layout.addWidget(group)
 
+        player_group = QGroupBox("Odtwarzacz")
+        player_form = QFormLayout(player_group)
+
+        self.player_skip_combo = QComboBox()
+        for seconds in (5, 10, 15, 30, 60):
+            self.player_skip_combo.addItem(f"{seconds} sekund", seconds)
+
+        current_skip = int(self.settings.get("player_skip_seconds", 5))
+        index = self.player_skip_combo.findData(current_skip)
+        self.player_skip_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.player_skip_combo.currentIndexChanged.connect(
+            self._player_skip_changed
+        )
+        player_form.addRow("⏩ Skok przy strzałkach:", self.player_skip_combo)
+        layout.addWidget(player_group)
+
         info = QLabel(
             "Folder źródłowy to domyślne miejsce, z którego DJ Library Manager "
             "będzie docelowo pobierał/indeksował muzykę.\n\n"
@@ -69,6 +87,12 @@ class SettingsWidget(QWidget):
         reset_btn.clicked.connect(self.reset_folders)
         layout.addWidget(reset_btn)
         layout.addStretch()
+
+    def _player_skip_changed(self, _index):
+        seconds = int(self.player_skip_combo.currentData() or 5)
+        self.settings["player_skip_seconds"] = seconds
+        self.settings_service.save(self.settings)
+        self.player_skip_changed.emit(seconds)
 
     def choose_folder(self, setting_name):
         current = self.settings.get(setting_name, str(Path.home()))

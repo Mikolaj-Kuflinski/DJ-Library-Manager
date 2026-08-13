@@ -25,6 +25,7 @@ class SettingsService:
             "source_folder": str(music_folder),
             "output_folder": str(default_output),
             "spotify_cookie_file": "",
+            "player_skip_seconds": 5,
         }
 
     def load(self):
@@ -35,8 +36,14 @@ class SettingsService:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
                     for key in settings:
-                        if loaded.get(key):
-                            settings[key] = str(loaded[key])
+                        if loaded.get(key) is not None:
+                            if key == "player_skip_seconds":
+                                try:
+                                    settings[key] = int(loaded[key])
+                                except (TypeError, ValueError):
+                                    pass
+                            else:
+                                settings[key] = str(loaded[key])
         except (OSError, ValueError, TypeError):
             pass
 

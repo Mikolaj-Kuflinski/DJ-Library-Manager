@@ -1,6 +1,7 @@
 from PySide6.QtCore import QMimeData, Qt, Signal
 from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import QListWidget, QAbstractItemView, QTabBar
+from src.widgets.track_list_view import TrackListViewMixin
 
 
 MIME_SONG_PATHS = "application/x-dj-song-paths"
@@ -72,9 +73,10 @@ class DragTabBar(QTabBar):
             event.ignore()
 
 
-class SongListWidget(QListWidget):
+class SongListWidget(TrackListViewMixin, QListWidget):
     def __init__(self):
         super().__init__()
+        self.init_track_view()
         self.setSelectionMode(
             QAbstractItemView.ExtendedSelection
         )
@@ -146,7 +148,7 @@ class PlaylistListWidget(QListWidget):
             event.ignore()
 
 
-class PlaylistTrackListWidget(QListWidget):
+class PlaylistTrackListWidget(TrackListViewMixin, QListWidget):
     """Utwory w playliście: reorder + przyjmowanie utworów z innych źródeł."""
 
     songs_dropped = Signal(list)
@@ -154,6 +156,7 @@ class PlaylistTrackListWidget(QListWidget):
 
     def __init__(self):
         super().__init__()
+        self.init_track_view()
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
         self.setDragEnabled(True)

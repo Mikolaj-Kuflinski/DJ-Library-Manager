@@ -12,6 +12,14 @@ from PySide6.QtWidgets import (
 )
 
 from src.widgets.tag_panel import TagPanel
+from src.widgets.track_list_view import TrackListViewMixin, TrackViewModeButton
+
+
+class NewTracksListWidget(TrackListViewMixin, QListWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.init_track_view()
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
 
 class NewTracksWidget(QWidget):
@@ -66,10 +74,20 @@ class NewTracksWidget(QWidget):
         content = QHBoxLayout()
 
         left = QVBoxLayout()
-        self.song_list = QListWidget()
+        self.song_list = NewTracksListWidget()
         self.song_list.setSelectionMode(
             QAbstractItemView.ExtendedSelection
         )
+
+        list_header = QHBoxLayout()
+        list_header.addStretch()
+        self.view_mode_button = TrackViewModeButton(
+            self.song_list,
+            "medium",
+        )
+        list_header.addWidget(self.view_mode_button)
+        left.addLayout(list_header)
+
         left.addWidget(self.song_list)
         content.addLayout(left, 2)
 

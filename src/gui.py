@@ -41,6 +41,7 @@ from src.services.error_book_service import ErrorBookService
 from src.services.spotify_metadata_service import SpotifyMetadataService
 from src.services.spotify_queue_service import SpotifyQueueService
 from src.services.audio_player_service import AudioPlayerService
+from src.services.cover_art_service import CoverArtService
 from src.widgets.player_widget import PlayerWidget
 
 
@@ -67,6 +68,7 @@ class MainWindow(QWidget):
         self.spotify_metadata_service = SpotifyMetadataService()
         self.spotify_queue_service = SpotifyQueueService()
         self.audio_player_service = AudioPlayerService(self)
+        self.cover_art_service = CoverArtService()
         self.audio_player_service.player.mediaStatusChanged.connect(
             self._player_media_status_changed
         )
@@ -120,6 +122,7 @@ class MainWindow(QWidget):
 
         self.player_widget = PlayerWidget(
             self.audio_player_service,
+            self.cover_art_service,
             self,
         )
         self.player_widget.set_skip_seconds(
@@ -213,6 +216,7 @@ class MainWindow(QWidget):
     def build_library_tab(self):
         self.library_widget = LibraryWidget(
             available_tags=self.available_tags,
+            cover_art_service=self.cover_art_service,
             parent=self.library_tab,
         )
 
@@ -223,10 +227,21 @@ class MainWindow(QWidget):
         self.counter = self.library_widget.counter
         self.selected_counter = self.library_widget.selected_counter
         self.song_list = self.library_widget.song_list
+        self.library_view_mode_button = self.library_widget.view_mode_button
+        self.library_view_mode_button.set_mode(
+            self.app_settings.get("library_view_mode", "medium")
+        )
+        self.song_list.set_view_mode(
+            self.app_settings.get("library_view_mode", "medium")
+        )
+        self.library_view_mode_button.mode_changed.connect(
+            lambda mode: self._save_view_mode("library_view_mode", mode)
+        )
         self.add_to_playlist_button = self.library_widget.add_to_playlist_button
         self.title = self.library_widget.title
         self.artist = self.library_widget.artist
         self.album = self.library_widget.album
+        self.library_cover = self.library_widget.cover_label
         self.tag_panel = self.library_widget.tag_panel
 
         self.search.textChanged.connect(self.apply_filters)
@@ -1426,6 +1441,17 @@ class MainWindow(QWidget):
         self.new_tracks_status = self.new_tracks_widget.status_filter
         self.new_tracks_search = self.new_tracks_widget.search
         self.new_tracks_list = self.new_tracks_widget.song_list
+        self.new_tracks_view_mode_button = self.new_tracks_widget.view_mode_button
+        self.new_tracks_view_mode_button.set_mode(
+            self.app_settings.get("new_tracks_view_mode", "medium")
+        )
+        self.new_tracks_list.set_view_mode(
+            self.app_settings.get("new_tracks_view_mode", "medium")
+        )
+        self.new_tracks_list.set_cover_art_service(self.cover_art_service)
+        self.new_tracks_view_mode_button.mode_changed.connect(
+            lambda mode: self._save_view_mode("new_tracks_view_mode", mode)
+        )
         self.new_tracks_tag_panel = self.new_tracks_widget.tag_panel
         self.new_tracks_finish_btn = self.new_tracks_widget.finish_btn
         self.new_tracks_refresh_btn = self.new_tracks_widget.refresh_btn
@@ -1511,6 +1537,7 @@ class MainWindow(QWidget):
             )
             item.setData(Qt.UserRole, path)
             self.new_tracks_list.addItem(item)
+            self.new_tracks_list._set_item_cover(item, path)
 
         active_count = len(self.new_track_session)
         self.new_tracks_count.setText(f"{active_count} w sesji")
@@ -1680,6 +1707,10 @@ class MainWindow(QWidget):
             self.playlist_generated_map
         )
 
+    def _save_view_mode(self, key, mode):
+        self.app_settings[key] = mode
+        self.settings_service.save(self.app_settings)
+
     # ==================== USTAWIENIA ====================
     def load_songs_from_source_folder(self):
         """Skanuje aktualnie wybrany folder źródłowy i zwraca jego utwory."""
@@ -1716,6 +1747,7 @@ class MainWindow(QWidget):
             self.title.clear()
             self.artist.clear()
             self.album.clear()
+            self.library_widget.set_cover_for_song(None)
 
     def settings_file_path(self):
         return self.settings_service.settings_file_path()
@@ -1798,6 +1830,17 @@ class MainWindow(QWidget):
         self.playlist_list = self.playlists_widget.playlist_list
         self.playlist_title = self.playlists_widget.playlist_title
         self.playlist_tracks = self.playlists_widget.playlist_tracks
+        self.playlist_view_mode_button = self.playlists_widget.playlist_view_mode_button
+        self.playlist_view_mode_button.set_mode(
+            self.app_settings.get("playlist_view_mode", "medium")
+        )
+        self.playlist_tracks.set_view_mode(
+            self.app_settings.get("playlist_view_mode", "medium")
+        )
+        self.playlist_tracks.set_cover_art_service(self.cover_art_service)
+        self.playlist_view_mode_button.mode_changed.connect(
+            lambda mode: self._save_view_mode("playlist_view_mode", mode)
+        )
         self.playlist_info = self.playlists_widget.playlist_info
 
         self.playlist_folder_filter.currentIndexChanged.connect(
@@ -2313,6 +2356,7 @@ class MainWindow(QWidget):
             )
             item.setData(Qt.ItemDataRole.UserRole, path)
             self.playlist_tracks.addItem(item)
+            self.playlist_tracks._set_item_cover(item, path)
             valid_paths.append(path)
         self.playlist_info.setText(f"Nazwa: {playlist['name']}\nUtworów: {len(valid_paths)}")
 
@@ -2773,6 +2817,7 @@ class MainWindow(QWidget):
             item = QListWidgetItem(f"{song.artist}\n{song.title}")
             item.setData(Qt.ItemDataRole.UserRole, song.path)
             self.song_list.addItem(item)
+            self.song_list._set_item_cover(item, song.path)
 
         self.song_list.blockSignals(False)
         self.counter.setText(f"Znaleziono: {len(self.filtered_songs)} utworów")
@@ -2785,6 +2830,7 @@ class MainWindow(QWidget):
             self.title.clear()
             self.artist.clear()
             self.album.clear()
+            self.library_widget.set_cover_for_song(None)
             self.tag_panel.load_song("")
 
     def clear_filters(self):
@@ -2809,7 +2855,11 @@ class MainWindow(QWidget):
 
     def song_selected(self,index):
         if index<0 or index>=len(self.filtered_songs): return
-        self.current_song=self.filtered_songs[index]; self.title.setText(self.current_song.title); self.artist.setText(self.current_song.artist); self.album.setText(self.current_song.album)
+        self.current_song=self.filtered_songs[index]
+        self.title.setText(self.current_song.title)
+        self.artist.setText(self.current_song.artist)
+        self.album.setText(self.current_song.album)
+        self.library_widget.set_cover_for_song(self.current_song.path)
         self.current_grouping=read_grouping(self.current_song.path); selected=self.get_selected_songs()
         if len(selected)>1: self.tag_panel.load_songs([self.tag_service.read_grouping(s.path) for s in selected])
         else: self.tag_panel.load_song(self.current_grouping)
@@ -2824,6 +2874,7 @@ class MainWindow(QWidget):
             return
         if self.audio_player_service.load(song.path):
             self.player_widget.set_track(song.artist, song.title)
+            self.player_widget.set_cover(song.path)
             self.audio_player_service.play()
 
     def play_current_song(self):

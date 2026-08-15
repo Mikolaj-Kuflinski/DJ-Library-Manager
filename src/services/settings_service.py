@@ -26,6 +26,9 @@ class SettingsService:
             "output_folder": str(default_output),
             "spotify_cookie_file": "",
             "player_skip_seconds": 5,
+            "library_view_mode": "medium",
+            "playlist_view_mode": "medium",
+            "new_tracks_view_mode": "medium",
         }
 
     def load(self):

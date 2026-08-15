@@ -1,4 +1,5 @@
 from PySide6.QtCore import Signal, Qt
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QStyle,
     QHBoxLayout,
@@ -54,10 +55,17 @@ class PlayerWidget(QWidget):
 
     # Arrow buttons are local seek controls; they no longer navigate tracks.
 
-    def __init__(self, player_service, parent=None):
+    def __init__(self, player_service, cover_art_service=None, parent=None):
         super().__init__(parent)
         self.player_service = player_service
+        self.cover_art_service = cover_art_service
         self.skip_seconds = 5
+
+        self.cover_label = QLabel()
+        self.cover_label.setFixedSize(64, 64)
+        self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cover_label.setText("♪")
+        self.cover_label.setToolTip("Okładka utworu")
 
         self.track_label = QLabel("Brak odtwarzanego utworu")
         self.track_label.setMinimumWidth(180)
@@ -111,6 +119,7 @@ class PlayerWidget(QWidget):
 
         layout = QVBoxLayout(self)
         top = QHBoxLayout()
+        top.addWidget(self.cover_label)
         top.addWidget(self.track_label, 1)
         top.addLayout(transport)
         layout.addLayout(top)
@@ -136,6 +145,25 @@ class PlayerWidget(QWidget):
             self.skip_seconds * 1000
         )
 
+    def set_cover(self, path):
+        self.cover_label.clear()
+        self.cover_label.setText("♪")
+        if self.cover_art_service is None:
+            return
+        data = self.cover_art_service.get_cover_bytes(path)
+        if not data:
+            return
+        pixmap = QPixmap()
+        if pixmap.loadFromData(data):
+            self.cover_label.setPixmap(
+                pixmap.scaled(
+                    self.cover_label.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            self.cover_label.setText("")
+
     def set_track(self, artist, title):
         text = " — ".join(
             part for part in (artist or "", title or "") if part
@@ -144,6 +172,8 @@ class PlayerWidget(QWidget):
 
     def clear_track(self):
         self.track_label.setText("Brak odtwarzanego utworu")
+        self.cover_label.clear()
+        self.cover_label.setText("♪")
         self.position_slider.setRange(0, 0)
         self.position_slider.setEnabled(False)
         self.time_label.setText("00:00 / 00:00")

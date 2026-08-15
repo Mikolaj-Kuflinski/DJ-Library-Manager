@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.widgets.playlist_widgets import PlaylistTrackListWidget
+from src.widgets.track_list_view import TrackViewModeButton
 
 
 class PlaylistTreeWidget(QTreeWidget):
@@ -301,6 +302,14 @@ class PlaylistsWidget(QWidget):
         middle.addWidget(self.playlist_title)
 
         self.playlist_tracks = PlaylistTrackListWidget()
+        track_header = QHBoxLayout()
+        track_header.addStretch()
+        self.playlist_view_mode_button = TrackViewModeButton(
+            self.playlist_tracks,
+            "medium",
+        )
+        track_header.addWidget(self.playlist_view_mode_button)
+        middle.addLayout(track_header)
         middle.addWidget(self.playlist_tracks)
 
         remove_track_btn = QPushButton(

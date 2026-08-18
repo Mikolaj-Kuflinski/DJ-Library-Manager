@@ -33,6 +33,7 @@ class SettingsService:
             "allow_delete_tag_playlists": False,
             "arrow_navigation_plays_track": False,
             "tag_category_shortcuts": {},
+            "spotify_sync_playlists": [],
         }
 
     def load(self):
@@ -63,6 +64,26 @@ class SettingsService:
                                         if str(name).strip()
                                         and str(sequence).strip()
                                     }
+                            elif key == "spotify_sync_playlists":
+                                if isinstance(loaded[key], list):
+                                    valid = []
+                                    for entry in loaded[key]:
+                                        if not isinstance(entry, dict):
+                                            continue
+                                        url = str(entry.get("url", "")).strip()
+                                        if not url:
+                                            continue
+                                        valid.append({
+                                            "url": url,
+                                            "name": str(
+                                                entry.get("name")
+                                                or "Nowa playlista"
+                                            ),
+                                            "has_updates": bool(
+                                                entry.get("has_updates", False)
+                                            ),
+                                        })
+                                    settings[key] = valid
                             else:
                                 settings[key] = str(loaded[key])
         except (OSError, ValueError, TypeError):

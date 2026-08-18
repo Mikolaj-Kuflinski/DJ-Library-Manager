@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import os
 import re
+from html import unescape
 import ctypes
 from datetime import datetime, timedelta
 
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QKeySequence, QShortcut, QDesktopServices
 from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QTimer, QUrl
 from PySide6.QtMultimedia import QMediaPlayer
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 
 from src.database_service import load_songs, update_song
 from src.tags import read_grouping, save_grouping, parse_grouping
@@ -27,7 +29,7 @@ from src.widgets.settings_widget import SettingsWidget
 from src.widgets.error_book_widget import ErrorBookWidget
 from src.widgets.playlists_widget import PlaylistsWidget
 from src.widgets.library_widget import LibraryWidget
-from src.widgets.spotify_widget import SpotifyWidget
+from src.widgets.spotify_widget import SpotifyWidget, SpotifySyncDialog
 from src.widgets.new_tracks_widget import NewTracksWidget
 from src.services.new_tracks_service import NewTracksService
 from src.services.playlist_metadata_service import PlaylistMetadataService
@@ -530,9 +532,56 @@ class MainWindow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.library_widget)
 
+    def open_spotify_sync_dialog(self):
+        if self.spotify_sync_dialog is None:
+            self.spotify_sync_dialog = SpotifySyncDialog(
+                self.spotify_sync_playlists,
+                self,
+            )
+            self.spotify_sync_dialog.playlists_changed.connect(
+                self.save_spotify_sync_playlists
+            )
+            self.spotify_sync_dialog.sync_requested.connect(
+                self.sync_spotify_playlist_from_popup
+            )
+        self.spotify_sync_dialog._playlists = list(
+            self.spotify_sync_playlists
+        )
+        self.spotify_sync_dialog._refresh_list()
+        self.spotify_sync_dialog.show()
+        self.spotify_sync_dialog.raise_()
+        self.spotify_sync_dialog.activateWindow()
+
+    def save_spotify_sync_playlists(self, playlists):
+        self.spotify_sync_playlists = list(playlists)
+        self.app_settings["spotify_sync_playlists"] = (
+            self.spotify_sync_playlists
+        )
+        self.save_app_settings()
+
+
+
+    def sync_spotify_playlist_from_popup(self, url):
+        # Reuse the existing Spotify download pipeline. The popup is only
+        # the management surface; the established download/queue logic
+        # remains responsible for handling the playlist.
+        self.spotify_url_edit.setText(url)
+        self.start_spotify_download()
+
     # ==================== SPOTIFY ====================
     def build_spotify_tab(self):
         self.spotify_widget = SpotifyWidget(self.spotify_tab)
+        self.spotify_sync_playlists_btn = (
+            self.spotify_widget.sync_playlists_btn
+        )
+        self.spotify_sync_playlists = self.app_settings.get(
+            "spotify_sync_playlists", []
+        )
+        self.spotify_sync_dialog = None
+
+        self.spotify_sync_playlists_btn.clicked.connect(
+            self.open_spotify_sync_dialog
+        )
 
         self.spotify_url_edit = self.spotify_widget.url_edit
         self.spotify_download_folder = self.spotify_widget.download_folder
@@ -914,7 +963,24 @@ class MainWindow(QWidget):
 
             if found_name:
                 item["name"] = found_name
+
+            sync_name = (
+                item.get("name")
+                if item.get("name") != "Pobieranie nazwy…"
+                else None
+            )
+            if sync_name:
+                self._update_saved_spotify_sync_playlist_name(
+                    url,
+                    sync_name,
+                )
             break
+
+        if collection:
+            self._update_saved_spotify_sync_playlist_name(
+                url,
+                collection[0],
+            )
 
         self.refresh_spotify_queue()
         self.start_next_spotify_metadata_resolution()

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QCheckBox,
     QScrollArea,
+    QKeySequenceEdit,
 )
 
 
@@ -32,6 +33,8 @@ class SettingsWidget(QWidget):
     tags_structure_changed = Signal()
     allow_tag_playlist_delete_changed = Signal(bool)
     tag_playlists_sync_requested = Signal()
+    arrow_navigation_plays_track_changed = Signal(bool)
+    tag_category_shortcuts_changed = Signal(dict)
 
     def __init__(self, settings, settings_service, tag_service=None, songs=None, parent=None):
         super().__init__(parent)
@@ -102,6 +105,51 @@ class SettingsWidget(QWidget):
             self._player_skip_changed
         )
         player_form.addRow("⏩ Skok przy strzałkach:", self.player_skip_combo)
+
+        self.player_exact_seek_combo = QComboBox()
+        for seconds in (1, 2, 5, 10, 15):
+            self.player_exact_seek_combo.addItem(
+                f"{seconds} sekund",
+                seconds,
+            )
+        current_exact = int(
+            self.settings.get("player_exact_seek_seconds", 5)
+        )
+        exact_index = self.player_exact_seek_combo.findData(current_exact)
+        self.player_exact_seek_combo.setCurrentIndex(
+            exact_index if exact_index >= 0 else 2
+        )
+        self.player_exact_seek_combo.currentIndexChanged.connect(
+            self._player_exact_seek_changed
+        )
+        player_form.addRow(
+            "🎯 Dokładne przewijanie (, / .):",
+            self.player_exact_seek_combo,
+        )
+
+        self.arrow_navigation_plays_track_checkbox = QCheckBox(
+            "Strzałki góra/dół od razu odtwarzają wybrany utwór"
+        )
+        self.arrow_navigation_plays_track_checkbox.setChecked(
+            bool(
+                self.settings.get(
+                    "arrow_navigation_plays_track",
+                    False,
+                )
+            )
+        )
+        self.arrow_navigation_plays_track_checkbox.setToolTip(
+            "Wyłączone: góra/dół tylko zmienia zaznaczenie. "
+            "Włączone: zmiana zaznaczenia uruchamia odtwarzanie."
+        )
+        self.arrow_navigation_plays_track_checkbox.toggled.connect(
+            self._arrow_navigation_plays_track_changed
+        )
+        player_form.addRow(
+            "⬆️⬇️ Nawigacja utworów:",
+            self.arrow_navigation_plays_track_checkbox,
+        )
+
         layout.addWidget(player_group)
 
         safety_group = QGroupBox("Bezpieczeństwo playlist")
@@ -158,6 +206,72 @@ class SettingsWidget(QWidget):
         )
         playlist_sync_layout.addWidget(sync_tag_playlists_btn)
         layout.addWidget(playlist_sync_group)
+
+        # ============================================================
+        # Skróty kategorii tagów
+        # ============================================================
+        shortcut_group = QGroupBox("Skróty kategorii tagów")
+        shortcut_layout = QVBoxLayout(shortcut_group)
+
+        shortcut_hint = QLabel(
+            "Ustaw skrót, którym aktywujesz kategorię tagów. "
+            "Domyślnie są to Ctrl+1, Ctrl+2 itd. Skrót działa jako "
+            "aktywna kategoria, a numer 1–9 nadal przełącza pojedyncze "
+            "tagi w tej kategorii."
+        )
+        shortcut_hint.setWordWrap(True)
+        shortcut_layout.addWidget(shortcut_hint)
+
+        self.tag_shortcut_edits = {}
+        self._tag_shortcut_values = {}
+
+        available_categories = list(get_available_tags().keys())
+        saved_shortcuts = self.settings.get(
+            "tag_category_shortcuts", {}
+        )
+        if not isinstance(saved_shortcuts, dict):
+            saved_shortcuts = {}
+
+        for index, category in enumerate(available_categories[:9]):
+            row = QHBoxLayout()
+            label = QLabel(f"{index + 1}. {category}")
+            edit = QKeySequenceEdit()
+
+            default_sequence = (
+                f"Ctrl+{index + 1}"
+            )
+            sequence = str(
+                saved_shortcuts.get(category, default_sequence)
+            ).strip()
+            edit.setKeySequence(sequence)
+
+            edit.setToolTip(
+                f"Skrót aktywujący kategorię „{category}”."
+            )
+            edit.keySequenceChanged.connect(
+                lambda seq, name=category:
+                self._tag_category_shortcut_changed(name, seq)
+            )
+
+            row.addWidget(label, 1)
+            row.addWidget(edit, 1)
+            shortcut_layout.addLayout(row)
+
+            self.tag_shortcut_edits[category] = edit
+            self._tag_shortcut_values[category] = sequence
+
+        reset_shortcuts_btn = QPushButton(
+            "↶ Przywróć domyślne skróty"
+        )
+        reset_shortcuts_btn.setToolTip(
+            "Ustaw Ctrl+1, Ctrl+2 itd. dla pierwszych kategorii."
+        )
+        reset_shortcuts_btn.clicked.connect(
+            self._reset_tag_category_shortcuts
+        )
+        shortcut_layout.addWidget(reset_shortcuts_btn)
+
+        layout.addWidget(shortcut_group)
 
         # ============================================================
         # Zarządzanie tagami
@@ -239,10 +353,71 @@ class SettingsWidget(QWidget):
         layout.addWidget(reset_btn)
         layout.addStretch()
 
+    def _player_exact_seek_changed(self, _index):
+        seconds = int(self.player_exact_seek_combo.currentData())
+        self.settings["player_exact_seek_seconds"] = seconds
+        self.settings_service.save(self.settings)
+
+    def _arrow_navigation_plays_track_changed(self, enabled):
+        self.settings["arrow_navigation_plays_track"] = bool(enabled)
+        self.settings_service.save(self.settings)
+        self.arrow_navigation_plays_track_changed.emit(bool(enabled))
+
     def _allow_tag_playlist_delete_changed(self, enabled):
         self.settings["allow_delete_tag_playlists"] = bool(enabled)
         self.settings_service.save(self.settings)
         self.allow_tag_playlist_delete_changed.emit(bool(enabled))
+
+    def _tag_category_shortcut_changed(self, category, sequence):
+        sequence_text = sequence.toString().strip()
+
+        # Empty means "disabled" and is allowed.
+        for other, value in self._tag_shortcut_values.items():
+            if other != category and value and value == sequence_text:
+                # Prevent ambiguous duplicate shortcuts.
+                QMessageBox.warning(
+                    self,
+                    "Skrót już używany",
+                    f"Skrót „{sequence_text}” jest już przypisany "
+                    f"do kategorii „{other}”.",
+                )
+                edit = self.tag_shortcut_edits.get(category)
+                if edit is not None:
+                    edit.blockSignals(True)
+                    edit.setKeySequence(
+                        self._tag_shortcut_values.get(category, "")
+                    )
+                    edit.blockSignals(False)
+                return
+
+        self._tag_shortcut_values[category] = sequence_text
+        shortcuts = {
+            name: value
+            for name, value in self._tag_shortcut_values.items()
+            if value
+        }
+        self.settings["tag_category_shortcuts"] = shortcuts
+        self.settings_service.save(self.settings)
+        self.tag_category_shortcuts_changed.emit(shortcuts)
+
+    def _reset_tag_category_shortcuts(self):
+        shortcuts = {}
+        for index, category in enumerate(
+            self.tag_shortcut_edits.keys()
+        ):
+            sequence = f"Ctrl+{index + 1}"
+            shortcuts[category] = sequence
+
+        for category, sequence in shortcuts.items():
+            edit = self.tag_shortcut_edits[category]
+            edit.blockSignals(True)
+            edit.setKeySequence(sequence)
+            edit.blockSignals(False)
+            self._tag_shortcut_values[category] = sequence
+
+        self.settings["tag_category_shortcuts"] = shortcuts
+        self.settings_service.save(self.settings)
+        self.tag_category_shortcuts_changed.emit(shortcuts)
 
     def _reload_tag_manager(self, select_category=None):
         self._tag_manager_data = get_available_tags()

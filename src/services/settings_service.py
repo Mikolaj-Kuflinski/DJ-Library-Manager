@@ -26,10 +26,13 @@ class SettingsService:
             "output_folder": str(default_output),
             "spotify_cookie_file": "",
             "player_skip_seconds": 5,
+            "player_exact_seek_seconds": 5,
             "library_view_mode": "medium",
             "playlist_view_mode": "medium",
             "new_tracks_view_mode": "medium",
             "allow_delete_tag_playlists": False,
+            "arrow_navigation_plays_track": False,
+            "tag_category_shortcuts": {},
         }
 
     def load(self):
@@ -41,13 +44,25 @@ class SettingsService:
                 if isinstance(loaded, dict):
                     for key in settings:
                         if loaded.get(key) is not None:
-                            if key == "player_skip_seconds":
+                            if key in ("player_skip_seconds", "player_exact_seek_seconds"):
                                 try:
                                     settings[key] = int(loaded[key])
                                 except (TypeError, ValueError):
                                     pass
-                            elif key == "allow_delete_tag_playlists":
+                            elif key in (
+                                "allow_delete_tag_playlists",
+                                "arrow_navigation_plays_track",
+                            ):
                                 settings[key] = bool(loaded[key])
+                            elif key == "tag_category_shortcuts":
+                                if isinstance(loaded[key], dict):
+                                    settings[key] = {
+                                        str(name): str(sequence)
+                                        for name, sequence
+                                        in loaded[key].items()
+                                        if str(name).strip()
+                                        and str(sequence).strip()
+                                    }
                             else:
                                 settings[key] = str(loaded[key])
         except (OSError, ValueError, TypeError):

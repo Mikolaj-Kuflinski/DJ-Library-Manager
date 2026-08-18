@@ -43,6 +43,8 @@ class TagPanel(QWidget):
         main_layout.addWidget(self.save_button)
 
         self.checkboxes = {}
+        self._category_titles = {}
+        self._active_category = None
         self._loading = False
         self._baseline = []
 
@@ -50,6 +52,11 @@ class TagPanel(QWidget):
         self.load_songs([grouping])
 
     def load_songs(self, groupings):
+
+        # Changing the selected track must not reset the user's active
+        # tag category. Keep the category name, rebuild the checkboxes
+        # for the new track, then restore the same category if it exists.
+        previous_category = self._active_category
 
         self._loading = True
         self._baseline = list(groupings)
@@ -61,6 +68,8 @@ class TagPanel(QWidget):
                 item.widget().deleteLater()
 
         self.checkboxes = {}
+        self._category_titles = {}
+        self._active_category = None
 
         parsed = [
             parse_grouping(grouping)
@@ -91,6 +100,7 @@ class TagPanel(QWidget):
                 margin-top:10px;
             """)
             category_layout.addWidget(title)
+            self._category_titles[category] = title
 
             self.checkboxes[category] = {}
 
@@ -154,6 +164,124 @@ class TagPanel(QWidget):
             )
 
         self._loading = False
+
+        if previous_category in self.checkboxes:
+            self._set_active_category(previous_category)
+
+    def focus_category(self, category):
+        """Activate a category by its stable name and show it visibly.
+
+        The category name, rather than a positional index, is used so
+        shortcuts do not depend on masonry column placement.
+        """
+        category = str(category or "").strip()
+        if category not in self.checkboxes:
+            return False
+
+        self._set_active_category(category)
+
+        values = list(self.checkboxes.get(category, {}).keys())
+        if values:
+            self.checkboxes[category][values[0]].setFocus()
+
+        return True
+
+    def _set_active_category(self, category):
+        self._active_category = category
+
+        for name, title in self._category_titles.items():
+            if name == category:
+                title.setStyleSheet("""
+                    font-size:16px;
+                    font-weight:bold;
+                    margin-top:10px;
+                    padding:4px 8px;
+                    border:1px solid palette(highlight);
+                    border-radius:5px;
+                """)
+                title.setToolTip(
+                    "Aktywna kategoria skrótów klawiszowych"
+                )
+            else:
+                title.setStyleSheet("""
+                    font-size:16px;
+                    font-weight:bold;
+                    margin-top:10px;
+                    padding:4px 8px;
+                """)
+                title.setToolTip("")
+
+    def keyPressEvent(self, event):
+        if event.key() in (
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        ):
+            focused = self.focusWidget()
+            if isinstance(focused, QCheckBox):
+                focused.setChecked(not focused.isChecked())
+                event.accept()
+                return
+
+        if event.key() == Qt.Key.Key_Tab:
+            self._focus_next_tag(reverse=bool(
+                event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            ))
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
+    def _focus_next_tag(self, reverse=False):
+        tags = [
+            checkbox
+            for category in self.checkboxes.values()
+            for checkbox in category.values()
+        ]
+        if not tags:
+            return
+
+        focused = self.focusWidget()
+        try:
+            index = tags.index(focused)
+        except ValueError:
+            index = 0 if reverse else -1
+
+        next_index = (
+            (index - 1) % len(tags)
+            if reverse
+            else (index + 1) % len(tags)
+        )
+        tags[next_index].setFocus()
+
+
+    def toggle_tag_by_number(self, number):
+        """Toggle the Nth tag in the currently focused category."""
+        if number < 1:
+            return
+
+        focused_category = self._active_category
+
+        if focused_category not in self.checkboxes:
+            for category, values in self.checkboxes.items():
+                for checkbox in values.values():
+                    if checkbox.hasFocus():
+                        focused_category = category
+                        break
+                if focused_category is not None:
+                    break
+
+        if focused_category is None:
+            return
+
+        values = list(
+            self.checkboxes.get(focused_category, {}).items()
+        )
+        index = number - 1
+        if index >= len(values):
+            return
+
+        checkbox = values[index][1]
+        checkbox.click()
 
     def set_baseline(self, groupings):
         self._baseline = list(groupings)

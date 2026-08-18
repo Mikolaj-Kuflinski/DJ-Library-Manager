@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QAbstractItemView, QPushButton, QComboBox, QTabWidget,
     QInputDialog, QMessageBox, QFileDialog, QToolButton, QDialog, QDialogButtonBox, QListWidgetItem,
     QFormLayout, QGroupBox, QProgressBar, QTreeWidget, QTreeWidgetItem,
+    QCheckBox,
 )
 from PySide6.QtGui import QKeySequence, QShortcut, QDesktopServices
 from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QTimer, QUrl
@@ -180,6 +181,71 @@ class MainWindow(QWidget):
             self.player_widget.skip_forward
         )
 
+        self.player_exact_backward_shortcut = QShortcut(
+            QKeySequence(","), self
+        )
+        self.player_exact_backward_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.player_exact_backward_shortcut.activated.connect(
+            lambda: self._exact_seek(-1)
+        )
+        self.player_exact_forward_shortcut = QShortcut(
+            QKeySequence("."), self
+        )
+        self.player_exact_forward_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.player_exact_forward_shortcut.activated.connect(
+            lambda: self._exact_seek(1)
+        )
+
+        # Keyboard navigation between tabs. Ctrl+Tab remains the native
+        # QTabWidget shortcut; these two mirror Chrome's Ctrl+PgUp/PgDn.
+        self.tab_previous_shortcut = QShortcut(
+            QKeySequence("Ctrl+PgUp"), self
+        )
+        self.tab_previous_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.tab_previous_shortcut.activated.connect(
+            lambda: self._cycle_tab(-1)
+        )
+
+        self.tab_next_shortcut = QShortcut(
+            QKeySequence("Ctrl+PgDown"), self
+        )
+        self.tab_next_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.tab_next_shortcut.activated.connect(
+            lambda: self._cycle_tab(1)
+        )
+
+        # Up/down always navigate tracks, even when the tag panel currently
+        # has focus. Left/right remain dedicated to player seek.
+        self.track_previous_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_Up), self
+        )
+        self.track_previous_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.track_previous_shortcut.activated.connect(
+            lambda: self._navigate_track_selection(-1)
+        )
+
+        self.track_next_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_Down), self
+        )
+        self.track_next_shortcut.setContext(
+            Qt.ShortcutContext.ApplicationShortcut
+        )
+        self.track_next_shortcut.activated.connect(
+            lambda: self._navigate_track_selection(1)
+        )
+
+        self._setup_tag_shortcuts()
+
         self.undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
         self.undo_shortcut.activated.connect(self.undo)
         self.redo_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
@@ -195,6 +261,206 @@ class MainWindow(QWidget):
         self.update_filter_tag_options()
         self.apply_filters()
         self.refresh_playlist_list()
+
+    def _exact_seek(self, direction):
+        seconds = int(
+            self.app_settings.get("player_exact_seek_seconds", 5)
+        )
+        current = int(self.audio_player_service.position())
+        duration = int(self.audio_player_service.duration())
+        target = max(0, current + direction * seconds * 1000)
+        if duration > 0:
+            target = min(target, duration)
+        self.audio_player_service.seek(target)
+
+    def _cycle_tab(self, delta):
+        count = self.tabs.count()
+        if count <= 1:
+            return
+        current = self.tabs.currentIndex()
+        self.tabs.setCurrentIndex((current + delta) % count)
+
+    def _current_track_list_for_keyboard(self):
+        index = self.tabs.currentIndex()
+
+        if index == self.tabs.indexOf(self.library_tab):
+            return self.song_list
+
+        if index == self.tabs.indexOf(self.new_tracks_tab):
+            return self.new_tracks_list
+
+        if index == self.tabs.indexOf(self.playlist_tab):
+            return self.playlist_tracks
+
+        return None
+
+    def _navigate_track_selection(self, delta):
+        track_list = self._current_track_list_for_keyboard()
+        if track_list is None or track_list.count() == 0:
+            return
+
+        current = track_list.currentRow()
+        if current < 0:
+            target = 0 if delta > 0 else track_list.count() - 1
+        else:
+            target = max(
+                0,
+                min(track_list.count() - 1, current + delta),
+            )
+
+        track_list.setCurrentRow(target)
+
+        if not bool(
+            self.app_settings.get(
+                "arrow_navigation_plays_track",
+                False,
+            )
+        ):
+            return
+
+        item = track_list.item(target)
+        if item is None:
+            return
+
+        if track_list is self.song_list:
+            self.play_current_song()
+        elif track_list is self.new_tracks_list:
+            self.play_new_track(item)
+        elif track_list is self.playlist_tracks:
+            self.play_playlist_track(item)
+
+    def _focus_tag_category_shortcut(self, category):
+        """Activate the named tag category in the current tagging panel."""
+        if self.tabs.currentIndex() == self.tabs.indexOf(
+            self.new_tracks_tab
+        ):
+            self.new_tracks_tag_panel.focus_category(category)
+        elif self.tabs.currentIndex() == self.tabs.indexOf(
+            self.library_tab
+        ):
+            self.tag_panel.focus_category(category)
+
+    def _clear_tag_category_shortcuts(self):
+        for shortcut in getattr(
+            self, "_tag_category_shortcuts", []
+        ):
+            shortcut.setEnabled(False)
+            shortcut.deleteLater()
+        self._tag_category_shortcuts = []
+
+    def _setup_tag_shortcuts(self):
+        self._clear_tag_category_shortcuts()
+
+        # Category shortcuts are mapped by CATEGORY NAME, never by the
+        # visual masonry column position. This prevents Ctrl+1 from
+        # accidentally selecting a category that happens to be elsewhere.
+        saved = self.app_settings.get(
+            "tag_category_shortcuts", {}
+        )
+        if not isinstance(saved, dict):
+            saved = {}
+
+        categories = list(self.available_tags.keys())
+        defaults = {
+            category: f"Ctrl+{index + 1}"
+            for index, category in enumerate(categories[:9])
+        }
+
+        for category in categories[:9]:
+            sequence = str(
+                saved.get(
+                    category,
+                    defaults.get(category, ""),
+                )
+            ).strip()
+            if not sequence:
+                continue
+
+            category_shortcut = QShortcut(
+                QKeySequence(sequence),
+                self,
+            )
+            category_shortcut.setContext(
+                Qt.ShortcutContext.ApplicationShortcut
+            )
+            category_shortcut.activated.connect(
+                lambda name=category:
+                self._focus_tag_category_shortcut(name)
+            )
+            self._tag_category_shortcuts.append(
+                category_shortcut
+            )
+
+        # Collect digits into one number: 10/57/123 are real tag numbers.
+        self._init_tag_number_input()
+
+        for digit in range(10):
+            shortcut = QShortcut(QKeySequence(str(digit)), self)
+            shortcut.setContext(
+                Qt.ShortcutContext.ApplicationShortcut
+            )
+            shortcut.activated.connect(
+                lambda n=digit: self._append_tag_number_digit(n)
+            )
+
+
+
+    def _tag_category_shortcuts_changed(self, shortcuts):
+        self.app_settings["tag_category_shortcuts"] = dict(
+            shortcuts or {}
+        )
+        self.save_app_settings()
+        self._setup_tag_shortcuts()
+
+    def _init_tag_number_input(self):
+        # Digits use a short debounce so:
+        #   1        -> tag 1
+        #   1 then 0 -> tag 10
+        # No Enter is required.
+        self._tag_number_buffer = ""
+        self._tag_number_timer = QTimer(self)
+        self._tag_number_timer.setSingleShot(True)
+        self._tag_number_timer.setInterval(120)
+        self._tag_number_timer.timeout.connect(
+            self._commit_tag_number_buffer
+        )
+
+    def _tag_panel_is_active(self):
+        current = self.tabs.currentIndex()
+        return current in (
+            self.tabs.indexOf(self.library_tab),
+            self.tabs.indexOf(self.new_tracks_tab),
+        )
+
+    def _append_tag_number_digit(self, digit):
+        if not self._tag_panel_is_active():
+            return
+
+        self._tag_number_buffer += str(digit)
+
+        # A rapid second digit extends the number (e.g. 1 -> 10).
+        # After the user stops typing digits for 450 ms, the whole
+        # number is committed automatically.
+        self._tag_number_timer.start()
+
+    def _commit_tag_number_buffer(self):
+        if not self._tag_number_buffer:
+            return
+
+        text = self._tag_number_buffer
+        self._tag_number_buffer = ""
+
+        try:
+            number = int(text)
+        except ValueError:
+            return
+
+        current = self.tabs.currentIndex()
+        if current == self.tabs.indexOf(self.library_tab):
+            self.tag_panel.toggle_tag_by_number(number)
+        elif current == self.tabs.indexOf(self.new_tracks_tab):
+            self.new_tracks_tag_panel.toggle_tag_by_number(number)
+
 
     def _normalize_playlist_path(self, path):
         return self.playlist_service.normalize_path(path)
@@ -1762,6 +2028,10 @@ class MainWindow(QWidget):
         self.app_settings["allow_delete_tag_playlists"] = bool(enabled)
         self.save_app_settings()
 
+    def _arrow_navigation_plays_track_changed(self, enabled):
+        self.app_settings["arrow_navigation_plays_track"] = bool(enabled)
+        self.save_app_settings()
+
     def _manual_sync_tag_playlists(self):
         self.sync_tag_playlists_silent()
 
@@ -1787,8 +2057,14 @@ class MainWindow(QWidget):
         self.settings_widget.tags_structure_changed.connect(
             self._tags_structure_changed
         )
+        self.settings_widget.tag_category_shortcuts_changed.connect(
+            self._tag_category_shortcuts_changed
+        )
         self.settings_widget.allow_tag_playlist_delete_changed.connect(
             self._allow_tag_playlist_delete_changed
+        )
+        self.settings_widget.arrow_navigation_plays_track_changed.connect(
+            self._arrow_navigation_plays_track_changed
         )
         self.settings_widget.tag_playlists_sync_requested.connect(
             self._manual_sync_tag_playlists

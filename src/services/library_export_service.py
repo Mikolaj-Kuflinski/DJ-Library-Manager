@@ -30,7 +30,13 @@ class LibraryExportService:
             str(value).encode("utf-8")
         ).hexdigest()[:16].upper()
 
-    def export_djay_pro(self, playlists, song_by_path, output_dir):
+    def export_djay_pro(
+        self,
+        playlists,
+        song_by_path,
+        output_dir,
+        folder_map=None,
+    ):
         try:
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -110,13 +116,74 @@ class LibraryExportService:
                     tracks[str(track_id)] = track
 
             playlists_xml = []
+            folder_map = folder_map or {}
+            folder_ids = {}
+
+            def add_folder(folder_path):
+                folder_path = str(folder_path or "").strip().strip("/")
+                if not folder_path:
+                    return None
+                if folder_path in folder_ids:
+                    return folder_ids[folder_path]
+
+                parts = [
+                    part.strip()
+                    for part in folder_path.split("/")
+                    if part.strip()
+                ]
+                built = []
+                parent_id = None
+
+                for part in parts:
+                    built.append(part)
+                    current = "/".join(built)
+                    if current in folder_ids:
+                        parent_id = folder_ids[current]
+                        continue
+
+                    persistent_id = self._persistent_id(
+                        "folder:" + current
+                    )
+                    folder_ids[current] = persistent_id
+
+                    entry = {
+                        "Playlist ID": next_playlist_id,
+                        "Playlist Persistent ID": persistent_id,
+                        "All Items": True,
+                        "Visible": True,
+                        "Name": part,
+                        "Playlist Folder": True,
+                    }
+                    if parent_id:
+                        entry["Parent Persistent ID"] = parent_id
+
+                    playlists_xml.append(entry)
+                    next_playlist_id += 1
+                    parent_id = persistent_id
+
+                return parent_id
+
+            # Folder order is the stored DJLM order, not alphabetical.
+            for folder in folder_map.get("__folders__", []):
+                add_folder(folder)
+
+            for playlist in playlists:
+                memberships = folder_map.get(
+                    playlist["name"], []
+                )
+                if isinstance(memberships, str):
+                    memberships = [memberships]
+                for folder in memberships:
+                    add_folder(folder)
+
             for playlist in playlists:
                 items = [
                     {"Track ID": path_to_id[p]}
                     for p in playlist.get("paths", [])
                     if p in path_to_id
                 ]
-                playlists_xml.append({
+
+                entry = {
                     "Playlist ID": next_playlist_id,
                     "Playlist Persistent ID": self._persistent_id(
                         "playlist:" + playlist["name"]
@@ -125,7 +192,19 @@ class LibraryExportService:
                     "Visible": True,
                     "Name": playlist["name"],
                     "Playlist Items": items,
-                })
+                }
+
+                memberships = folder_map.get(
+                    playlist["name"], []
+                )
+                if isinstance(memberships, str):
+                    memberships = [memberships]
+                if memberships:
+                    parent_id = add_folder(memberships[0])
+                    if parent_id:
+                        entry["Parent Persistent ID"] = parent_id
+
+                playlists_xml.append(entry)
                 next_playlist_id += 1
 
             plist = {

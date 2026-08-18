@@ -135,6 +135,17 @@ class LibraryWidget(QWidget):
         self.tag_panel = TagPanel()
         layout.addWidget(self.tag_panel, 2)
 
+    def refresh_available_tags(self, available_tags):
+        current_category = self.category_filter.currentData()
+        self.category_filter.blockSignals(True)
+        self.category_filter.clear()
+        self.category_filter.addItem("Wszystkie kategorie", "")
+        for category in available_tags:
+            self.category_filter.addItem(category, category)
+        index = self.category_filter.findData(current_category)
+        self.category_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.category_filter.blockSignals(False)
+
     def set_cover_for_song(self, path):
         self.cover_label.clear()
         self.cover_label.setText("♪")

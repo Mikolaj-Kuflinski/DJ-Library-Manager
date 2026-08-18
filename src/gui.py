@@ -1758,11 +1758,24 @@ class MainWindow(QWidget):
     def save_app_settings(self):
         self.settings_service.save(self.app_settings)
 
+    def _allow_tag_playlist_delete_changed(self, enabled):
+        self.app_settings["allow_delete_tag_playlists"] = bool(enabled)
+        self.save_app_settings()
+
+    def _manual_sync_tag_playlists(self):
+        self.sync_tag_playlists_silent()
+
+        # Keep the currently displayed playlist contents in sync as well.
+        if hasattr(self, "playlist_list"):
+            self.refresh_playlist_list()
+
     def build_settings_tab(self):
         layout = QVBoxLayout(self.settings_tab)
         self.settings_widget = SettingsWidget(
             self.app_settings,
             self.settings_service,
+            tag_service=self.tag_service,
+            songs=self.songs,
             parent=self.settings_tab,
         )
         self.settings_widget.source_folder_changed.connect(
@@ -1771,7 +1784,45 @@ class MainWindow(QWidget):
         self.settings_widget.player_skip_changed.connect(
             self.player_widget.set_skip_seconds
         )
+        self.settings_widget.tags_structure_changed.connect(
+            self._tags_structure_changed
+        )
+        self.settings_widget.allow_tag_playlist_delete_changed.connect(
+            self._allow_tag_playlist_delete_changed
+        )
+        self.settings_widget.tag_playlists_sync_requested.connect(
+            self._manual_sync_tag_playlists
+        )
         layout.addWidget(self.settings_widget)
+
+    def _tags_structure_changed(self):
+        self.available_tags = get_available_tags()
+
+        # Keep generated tag playlists synchronized with category/tag
+        # changes made in Settings.
+        self.sync_tag_playlists_silent()
+
+        if hasattr(self, "library_widget"):
+            self.library_widget.refresh_available_tags(
+                self.available_tags
+            )
+
+        if hasattr(self, "tag_panel"):
+            selected = self.get_selected_songs()
+            self.tag_panel.load_songs(
+                [song.grouping for song in selected]
+                if selected else [""]
+            )
+
+        if hasattr(self, "new_tracks_tag_panel"):
+            selected_new = self.get_selected_new_tracks()
+            self.new_tracks_tag_panel.load_songs(
+                [song.grouping for song in selected_new]
+                if selected_new else [""]
+            )
+
+        self.update_filter_tag_options()
+        self.apply_filters()
 
     def _settings_source_folder_changed(self, folder):
         self.app_settings["source_folder"] = folder
@@ -1849,6 +1900,9 @@ class MainWindow(QWidget):
         self.playlist_list.itemClicked.connect(
             self.playlist_tree_item_clicked
         )
+        self.playlist_list.folder_selected.connect(
+            self._remember_folder_selected_for_delete
+        )
         self.playlists_widget.playlist_dropped.connect(
             self.handle_playlist_drop
         )
@@ -1880,13 +1934,18 @@ class MainWindow(QWidget):
         self.playlists_widget.export_djay_requested.connect(
             self.export_to_djay_pro
         )
-        self.playlists_widget.sync_tags_requested.connect(
-            self.sync_tag_playlists
-        )
+        # Tag-derived playlists are synchronized automatically.
 
         layout = QHBoxLayout(self.playlist_tab)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.playlists_widget)
+
+    def playlist_folders_for_all_names(self):
+        return [
+            playlist.get("name", "")
+            for playlist in self.playlists
+            if playlist.get("name", "")
+        ]
 
     def playlist_folders_for(self, playlist_name):
         value = self.playlist_folder_map.get(playlist_name, [])
@@ -1950,10 +2009,11 @@ class MainWindow(QWidget):
                 self.playlist_folders_for(playlist["name"])
             )
 
-        folders = sorted(
-            set(str(folder) for folder in folders if str(folder).strip()),
-            key=lambda value: (value.count("/"), value.casefold()),
-        )
+        folders = list(dict.fromkeys(
+            str(folder).strip()
+            for folder in folders
+            if str(folder).strip()
+        ))
 
         self.playlist_folder_filter.blockSignals(True)
         self.playlist_folder_filter.clear()
@@ -2097,6 +2157,11 @@ class MainWindow(QWidget):
             self.current_playlist_index = -1
             self.refresh_playlist_contents()
 
+    def _remember_folder_selected_for_delete(self, folder):
+        self._selected_playlist_folder_path = str(
+            folder or ""
+        ).strip().strip("/")
+
     def playlist_tree_item_clicked(self, item, column=0):
         if item is None:
             return
@@ -2162,17 +2227,39 @@ class MainWindow(QWidget):
         self.refresh_playlist_list()
 
 
-    def delete_playlist_folder(self):
-        folder = (
-            self.playlist_folder_filter.currentData()
-            if hasattr(self, "playlist_folder_filter")
-            else ""
-        )
+    def delete_playlist_folder(self, folder=""):
+        folder = str(
+            folder or getattr(
+                self, "_selected_playlist_folder_path", ""
+            ) or ""
+        ).strip().strip("/")
+
         if not folder:
+            QMessageBox.information(
+                self,
+                "Usuń folder",
+                "Najpierw kliknij folder na drzewie po lewej.",
+            )
             return
+
+        generated_root = "Playlisty z tagów"
+        if (
+            folder == generated_root
+            or folder.startswith(generated_root + "/")
+        ):
+            QMessageBox.information(
+                self,
+                "Folder zarządzany przez tagi",
+                "Tego folderu nie usuwa się ręcznie. Jest tworzony "
+                "automatycznie na podstawie kategorii i tagów.",
+            )
+            return
+
         answer = QMessageBox.question(
-            self, "Usuń folder",
-            f"Usunąć folder „{folder}”? Playlisty w nim pozostaną."
+            self,
+            "Usuń folder",
+            f"Usunąć folder „{folder}”?\n\n"
+            "Folder zostanie usunięty, ale playlisty pozostaną.",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -2182,160 +2269,200 @@ class MainWindow(QWidget):
             folder,
         )
         self.save_playlist_folder_map()
+        self._selected_playlist_folder_path = ""
         self.refresh_playlist_list()
 
     def normalize_tag_folder(self, category):
         return self.tag_service.normalize_folder(category)
 
     def sync_tag_playlists_silent(self):
-        existing = {p["name"].casefold(): p for p in self.playlists}
-        changed = False
-        for song in self.songs:
-            try:
-                grouping = read_grouping(song.path)
-                tags = parse_grouping(grouping)
-            except Exception:
-                # Some library files (e.g. WAV without an ID3 header) cannot
-                # be read through EasyID3. They simply have no tag-derived
-                # playlist data and must not crash the application.
-                continue
+        """Synchronize tag playlists automatically.
 
-            for category, values in tags.items():
-                folder = self.normalize_tag_folder(category)
-                for value in values:
-                    name = str(value).strip()
-                    if not name:
-                        continue
-                    playlist = existing.get(name.casefold())
-                    if playlist is None:
-                        playlist = {"name": name, "paths": []}
-                        self.playlists.append(playlist)
-                        existing[name.casefold()] = playlist
-                        changed = True
-                    if song.path not in playlist["paths"]:
-                        playlist["paths"].append(song.path)
-                        changed = True
-                    self.set_playlist_folders(name, [folder])
-                    self.playlist_generated_map[name] = True
-        if changed:
-            self.playlist_storage_service.save(self.playlists)
-        self.save_playlist_folder_map()
-        self.save_playlist_generated_map()
-        if hasattr(self, "playlist_list"):
-            self.refresh_playlist_list()
+        Hierarchy:
+            Playlisty z tagów/<category>/<tag>
 
-    def sync_tag_playlists(self):
-        """Synchronize generated playlists from the library's tag grouping."""
-        # Build the desired membership from the actual tag data on disk.
+        Category/tag order comes from config/tags.json. Existing playlist
+        order is never rewritten, so manual drag-and-drop order persists.
+        """
+        available = get_available_tags()
+        generated_root = "Playlisty z tagów"
         desired = {}
-        desired_folders = {}
+        desired_order = []
+
+        for category, values in available.items():
+            category_name = str(category).strip()
+            if not category_name:
+                continue
+            if not isinstance(values, (list, tuple, set)):
+                values = [values]
+
+            for value in values:
+                name = str(value).strip()
+                if not name:
+                    continue
+                key = name.casefold()
+                if key not in desired:
+                    desired_order.append(key)
+                    desired[key] = {
+                        "name": name,
+                        "folder": f"{generated_root}/{category_name}",
+                        "paths": [],
+                    }
 
         for song in self.songs:
-            raw = read_grouping(song.path)
             try:
-                tags = parse_grouping(raw)
+                tags = parse_grouping(
+                    getattr(song, "grouping", "") or ""
+                )
             except Exception:
                 tags = {}
 
-            # Fallback to the cached grouping if parsing the file fails.
-            if not tags:
-                try:
-                    tags = parse_grouping(getattr(song, "grouping", "") or "")
-                except Exception:
-                    tags = {}
-
             for category, values in tags.items():
+                category_name = str(category).strip()
+                if not category_name:
+                    continue
                 if not isinstance(values, (list, tuple, set)):
                     values = [values]
 
-                folder = self.normalize_tag_folder(category)
                 for value in values:
                     name = str(value).strip()
                     if not name:
                         continue
-
                     key = name.casefold()
-                    desired.setdefault(key, {
-                        "name": name,
-                        "paths": [],
-                        "folder": folder,
-                        "category": str(category),
-                    })
-                    normalized_path = self._normalize_playlist_path(song.path)
-                    if normalized_path not in desired[key]["paths"]:
-                        desired[key]["paths"].append(normalized_path)
+                    if key not in desired:
+                        desired_order.append(key)
+                        desired[key] = {
+                            "name": name,
+                            "folder": (
+                                f"{generated_root}/{category_name}"
+                            ),
+                            "paths": [],
+                        }
 
-        for playlist in self.playlists:
-            if self.playlist_generated_map.get(playlist.get("name", ""), False):
-                playlist["paths"] = [
-                    self._normalize_playlist_path(path)
-                    for path in playlist.get("paths", [])
-                    if path
-                ]
+                    path = self._normalize_playlist_path(song.path)
+                    if path and path not in desired[key]["paths"]:
+                        desired[key]["paths"].append(path)
 
-        # Generated playlists are identified by playlist_generated_map.
-        # User-created playlists are never deleted or overwritten.
-        generated_names = {
-            name.casefold()
-            for name, generated in self.playlist_generated_map.items()
-            if generated
+        # Folder hierarchy in tag-category order.
+        folder_order = [generated_root]
+        for category in available.keys():
+            category_name = str(category).strip()
+            if category_name:
+                folder_order.append(
+                    f"{generated_root}/{category_name}"
+                )
+        for key in desired_order:
+            folder = desired[key]["folder"]
+            if folder not in folder_order:
+                folder_order.append(folder)
+
+        # Remove old top-level category folders created by previous
+        # tag-playlist versions, but only when they contain no manual
+        # playlists.
+        old_category_roots = {
+            str(category).strip()
+            for category in available.keys()
+            if str(category).strip()
         }
+        existing_folders = list(
+            self.playlist_folder_map.get("__folders__", [])
+        )
+        cleaned = []
+        for folder in existing_folders:
+            if folder in old_category_roots:
+                has_manual = any(
+                    folder in self.playlist_folders_for(name)
+                    and not self.playlist_generated_map.get(name, False)
+                    for name in self.playlist_folders_for_all_names()
+                ) if hasattr(self, "playlist_folders_for_all_names") else False
+                if not has_manual:
+                    continue
+            if folder not in cleaned:
+                cleaned.append(folder)
 
-        by_name = {p["name"].casefold(): p for p in self.playlists}
+        for folder in folder_order:
+            if folder not in cleaned:
+                cleaned.append(folder)
+        self.playlist_folder_map["__folders__"] = cleaned
+
+        by_name = {
+            playlist.get("name", "").casefold(): playlist
+            for playlist in self.playlists
+        }
         changed = False
 
-        # Update/create generated playlists.
-        for key, wanted in desired.items():
+        # Create new playlists in tag order; never move existing playlists.
+        for desired_index, key in enumerate(desired_order):
+            wanted = desired[key]
             playlist = by_name.get(key)
+
             if playlist is None:
                 playlist = {
                     "name": wanted["name"],
                     "paths": list(wanted["paths"]),
                 }
-                self.playlists.append(playlist)
+                insert_at = len(self.playlists)
+
+                previous = [
+                    by_name[k]
+                    for k in desired_order[:desired_index]
+                    if k in by_name
+                ]
+                if previous:
+                    insert_at = self.playlists.index(previous[-1]) + 1
+
+                self.playlists.insert(insert_at, playlist)
                 by_name[key] = playlist
                 changed = True
             else:
-                if playlist.get("paths", []) != wanted["paths"] and (
-                    key in generated_names
+                new_paths = list(wanted["paths"])
+                if (
+                    self.playlist_generated_map.get(
+                        wanted["name"], False
+                    )
+                    and playlist.get("paths", []) != new_paths
                 ):
-                    playlist["paths"] = list(wanted["paths"])
+                    playlist["paths"] = new_paths
                     changed = True
 
-            self.set_playlist_folders(
-                wanted["name"],
-                [wanted["folder"]] if wanted["folder"] else [],
-            )
-            self.playlist_generated_map[wanted["name"]] = True
+            if self.playlist_folders_for(wanted["name"]) != [
+                wanted["folder"]
+            ]:
+                self.set_playlist_folders(
+                    wanted["name"],
+                    [wanted["folder"]],
+                )
+                changed = True
 
-        # Remove old memberships from generated playlists when tags were removed.
-        for playlist in self.playlists:
-            key = playlist["name"].casefold()
-            if key in generated_names and key not in desired:
-                if playlist.get("paths"):
-                    playlist["paths"] = []
-                    changed = True
+            if not self.playlist_generated_map.get(
+                wanted["name"], False
+            ):
+                self.playlist_generated_map[wanted["name"]] = True
+                changed = True
 
-        # Ensure category folders exist in the folder list.
-        self.playlist_folder_map.setdefault("__folders__", [])
-        for wanted in desired.values():
-            folder = wanted["folder"]
-            if folder and folder not in self.playlist_folder_map["__folders__"]:
-                self.playlist_folder_map["__folders__"].append(folder)
+        desired_keys=set(desired)
+        for playlist in list(self.playlists):
+            name=playlist.get("name","")
+            key=name.casefold()
+            if (
+                self.playlist_generated_map.get(name,False)
+                and key not in desired_keys
+            ):
+                self.playlists.remove(playlist)
+                self.playlist_generated_map.pop(name,None)
+                self.playlist_folder_map.pop(name,None)
+                changed=True
 
         if changed:
             self.playlist_storage_service.save(self.playlists)
-
         self.save_playlist_folder_map()
         self.save_playlist_generated_map()
-        self.refresh_playlist_list()
+        if hasattr(self,"playlist_list"):
+            self.refresh_playlist_list()
 
-        QMessageBox.information(
-            self,
-            "Playlisty z tagów",
-            f"Utworzono/zaktualizowano {len(desired)} playlist z tagów.\n\n"
-            "Language → folder „lang”; pozostałe kategorie → własne foldery."
-        )
+    def sync_tag_playlists(self):
+        """Compatibility entry point; synchronization is automatic."""
+        self.sync_tag_playlists_silent()
 
     def refresh_playlist_contents(self):
         self.playlist_tracks.clear()
@@ -2527,12 +2654,62 @@ class MainWindow(QWidget):
         self.refresh_playlist_list()
 
     def delete_playlist(self):
-        if not (0 <= self.current_playlist_index < len(self.playlists)):
+        index = self.current_playlist_index
+
+        if hasattr(self, "playlist_list"):
+            item = self.playlist_list.currentItem()
+            if (
+                item is not None
+                and item.data(0, Qt.ItemDataRole.UserRole) == "playlist"
+            ):
+                selected_index = item.data(
+                    0, Qt.ItemDataRole.UserRole + 1
+                )
+                if isinstance(selected_index, int):
+                    index = selected_index
+
+        if not (0 <= index < len(self.playlists)):
+            QMessageBox.information(
+                self,
+                "Usuń playlistę",
+                "Najpierw zaznacz playlistę, którą chcesz usunąć.",
+            )
             return
 
-        name = self.playlists[self.current_playlist_index]["name"]
+        self.current_playlist_index = index
+        name = self.playlists[index]["name"]
+        generated = bool(
+            self.playlist_generated_map.get(name, False)
+        )
+
+        if generated and not bool(
+            self.app_settings.get(
+                "allow_delete_tag_playlists", False
+            )
+        ):
+            QMessageBox.information(
+                self,
+                "Playlist z tagów",
+                f"„{name}” jest playlistą utworzoną automatycznie z tagu.\n\n"
+                "Usuwanie takich playlist jest zablokowane. "
+                "Włącz w Ustawieniach opcję "
+                "„Zezwól na usuwanie playlist z tagów”, "
+                "jeśli chcesz ją usunąć.",
+            )
+            return
+
+        question = f"Usunąć playlistę „{name}”?"
+        if generated:
+            question += (
+                "\n\nUwaga: jest to playlista z tagów. "
+                "Jeżeli odpowiadający tag nadal istnieje, "
+                "automatyczna synchronizacja może ją ponownie utworzyć."
+            )
+
         answer = QMessageBox.question(
-            self, "Usuń playlistę", f"Usunąć playlistę „{name}”?"
+            self,
+            "Usuń playlistę",
+            question,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -2540,12 +2717,12 @@ class MainWindow(QWidget):
         before = self.snapshot_playlists()
         self.playlist_service.delete(
             self.playlists,
-            self.current_playlist_index,
+            index,
             self.playlist_folder_map,
             self.playlist_generated_map,
         )
         self.current_playlist_index = min(
-            self.current_playlist_index, len(self.playlists) - 1
+            index, len(self.playlists) - 1
         )
         self.record_playlist_change(before)
         self.save_playlist_folder_map()
@@ -2765,6 +2942,7 @@ class MainWindow(QWidget):
             self.playlists,
             self.song_by_path,
             output_dir,
+            folder_map=self.playlist_folder_map,
         )
 
         if path is None:
@@ -2947,10 +3125,9 @@ class MainWindow(QWidget):
         )
         self.tag_panel.set_baseline([song.grouping for song in selected])
 
-        # Tag -> playlist synchronization is intentionally disabled for v0.10.
-        # It performs a full library scan + metadata read on every tag click,
-        # which makes an otherwise local UI action feel slow. The feature is
-        # postponed to v0.11 and will be implemented as a dedicated service.
+        # Tag-derived playlists update immediately from the in-memory
+        # groupings, without rescanning the audio files.
+        self.sync_tag_playlists_silent()
 
     # ==================== UNDO / REDO ====================
     def restore_playlist_snapshot(self, snapshot):

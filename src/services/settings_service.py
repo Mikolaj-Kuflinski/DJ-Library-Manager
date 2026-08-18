@@ -29,6 +29,7 @@ class SettingsService:
             "library_view_mode": "medium",
             "playlist_view_mode": "medium",
             "new_tracks_view_mode": "medium",
+            "allow_delete_tag_playlists": False,
         }
 
     def load(self):
@@ -45,6 +46,8 @@ class SettingsService:
                                     settings[key] = int(loaded[key])
                                 except (TypeError, ValueError):
                                     pass
+                            elif key == "allow_delete_tag_playlists":
+                                settings[key] = bool(loaded[key])
                             else:
                                 settings[key] = str(loaded[key])
         except (OSError, ValueError, TypeError):

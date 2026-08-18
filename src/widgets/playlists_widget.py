@@ -21,6 +21,7 @@ class PlaylistTreeWidget(QTreeWidget):
     """Playlist/folder tree with explicit Windows-like drag semantics."""
 
     playlist_dropped = Signal(int, object, object, int, object)
+    folder_selected = Signal(str)
 
     MIME_TYPE = "application/x-djlm-playlist"
 
@@ -50,6 +51,17 @@ class PlaylistTreeWidget(QTreeWidget):
         self._press_pos = event.position().toPoint()
         self._drag_button = event.button()
         super().mousePressEvent(event)
+
+        item = self.itemAt(event.position().toPoint())
+        if item is not None and item.data(
+            0, Qt.ItemDataRole.UserRole
+        ) == "folder":
+            folder = str(
+                item.data(
+                    0, Qt.ItemDataRole.UserRole + 2
+                ) or ""
+            ).strip().strip("/")
+            self.folder_selected.emit(folder)
 
     def _capture_expanded_folders(self):
         expanded = set()
@@ -225,19 +237,76 @@ class PlaylistsWidget(QWidget):
     rename_requested = Signal()
     delete_requested = Signal()
     folder_create_requested = Signal()
-    folder_delete_requested = Signal()
+    folder_delete_requested = Signal(str)
     remove_tracks_requested = Signal()
     export_m3u8_requested = Signal()
     export_djay_requested = Signal()
-    sync_tags_requested = Signal()
     playlist_dropped = Signal(int, object, object, int, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._folder_selected_for_delete = ""
         self._build_ui()
+        self.playlist_list.folder_selected.connect(
+            self._remember_folder_selection
+        )
+
+    def _remember_folder_selection(self, folder):
+        self._folder_selected_for_delete = str(
+            folder or ""
+        ).strip().strip("/")
 
     def _request_folder_create(self):
         self.folder_create_requested.emit()
+
+    def _request_folder_delete(self):
+        # Resolve the folder directly from the tree at the exact moment
+        # the folder-delete button is pressed. Never use the currently
+        # selected playlist/current_playlist_index here.
+        folder = ""
+        item = self.playlist_list.currentItem()
+        if item is not None:
+            kind = item.data(
+                0, Qt.ItemDataRole.UserRole
+            )
+            if kind == "folder":
+                folder = str(
+                    item.data(
+                        0, Qt.ItemDataRole.UserRole + 2
+                    ) or ""
+                ).strip().strip("/")
+
+        if not folder:
+            folder = getattr(
+                self, "_folder_selected_for_delete", ""
+            )
+
+        self.folder_delete_requested.emit(folder)
+
+    def _request_delete_selected(self):
+        """Use one delete button for both playlists and folders.
+
+        The action is resolved from the actual tree selection, so the user
+        never has to guess which of two different trash buttons to use.
+        """
+        item = self.playlist_list.currentItem()
+        if item is None:
+            self.delete_requested.emit()
+            return
+
+        kind = item.data(0, Qt.ItemDataRole.UserRole)
+
+        if kind == "folder":
+            folder = str(
+                item.data(
+                    0, Qt.ItemDataRole.UserRole + 2
+                ) or ""
+            ).strip().strip("/")
+            self.folder_delete_requested.emit(folder)
+            return
+
+        # Playlist selection: keep the existing playlist-delete path.
+        self.delete_requested.emit()
 
     def _build_ui(self):
         layout = QHBoxLayout(self)
@@ -254,11 +323,6 @@ class PlaylistsWidget(QWidget):
         add_folder_btn = QPushButton("＋ Folder")
         add_folder_btn.clicked.connect(self._request_folder_create)
         folder_row.addWidget(add_folder_btn)
-
-        remove_folder_btn = QPushButton("🗑")
-        remove_folder_btn.setToolTip("Usuń folder (playlisty zostają)")
-        remove_folder_btn.clicked.connect(self.folder_delete_requested.emit)
-        folder_row.addWidget(remove_folder_btn)
 
         left.addLayout(folder_row)
 
@@ -280,15 +344,11 @@ class PlaylistsWidget(QWidget):
         playlist_buttons.addWidget(rename_btn)
 
         delete_btn = QPushButton("🗑 Usuń")
-        delete_btn.clicked.connect(self.delete_requested.emit)
-        playlist_buttons.addWidget(delete_btn)
-
-        sync_tags_btn = QPushButton("🏷️ Playlisty z tagów")
-        sync_tags_btn.setToolTip(
-            "Utwórz/odśwież playlisty na podstawie kategorii i tagów"
+        delete_btn.setToolTip(
+            "Usuń zaznaczoną playlistę albo zaznaczony folder"
         )
-        sync_tags_btn.clicked.connect(self.sync_tags_requested.emit)
-        playlist_buttons.addWidget(sync_tags_btn)
+        delete_btn.clicked.connect(self._request_delete_selected)
+        playlist_buttons.addWidget(delete_btn)
 
         left.addLayout(playlist_buttons)
         layout.addLayout(left, 1)

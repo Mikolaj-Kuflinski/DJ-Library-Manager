@@ -1,7 +1,9 @@
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
     QLabel,
     QCheckBox,
     QScrollArea,
@@ -26,7 +28,12 @@ class TagPanel(QWidget):
         self.scroll.setWidgetResizable(True)
 
         self.container = QWidget()
-        self.layout = QVBoxLayout(self.container)
+        self.layout = QHBoxLayout(self.container)
+        self.layout.setContentsMargins(4, 4, 4, 4)
+        self.layout.setSpacing(18)
+        self.layout.setAlignment(
+            Qt.AlignmentFlag.AlignTop
+        )
 
         self.scroll.setWidget(self.container)
         main_layout.addWidget(self.scroll)
@@ -62,7 +69,20 @@ class TagPanel(QWidget):
 
         available = get_available_tags()
 
+        # Masonry-style columns.
+        #
+        # Categories are kept intact (title + all checkboxes), but each
+        # category is placed into the currently shortest column. This avoids
+        # the large empty spaces produced by a normal row/column grid when
+        # categories contain different numbers of tags.
+        category_widgets = []
+
         for category, values in available.items():
+
+            category_widget = QWidget()
+            category_layout = QVBoxLayout(category_widget)
+            category_layout.setContentsMargins(0, 0, 0, 0)
+            category_layout.setSpacing(3)
 
             title = QLabel(category)
             title.setStyleSheet("""
@@ -70,7 +90,7 @@ class TagPanel(QWidget):
                 font-weight:bold;
                 margin-top:10px;
             """)
-            self.layout.addWidget(title)
+            category_layout.addWidget(title)
 
             self.checkboxes[category] = {}
 
@@ -78,31 +98,61 @@ class TagPanel(QWidget):
 
                 checkbox = QCheckBox(value)
 
-                # W trybie multi-select tag jest pokazany jako
-                # zaznaczony, jeżeli ma go CHOCIAŻ JEDEN
-                # z zaznaczonych utworów.
-                #
-                # Dzięki temu brak tagu w jednym utworze nie
-                # powoduje jego usunięcia przy dodawaniu innego.
                 has_tag = any(
                     value in tags.get(category, [])
                     for tags in parsed
                 )
 
                 checkbox.setChecked(has_tag)
-
                 checkbox.stateChanged.connect(
                     self._checkbox_changed
                 )
 
-                self.layout.addWidget(checkbox)
+                category_layout.addWidget(checkbox)
                 self.checkboxes[category][value] = checkbox
 
             line = QFrame()
             line.setFrameShape(QFrame.HLine)
-            self.layout.addWidget(line)
+            category_layout.addWidget(line)
 
-        self.layout.addStretch()
+            # Approximate height used only for distribution. A category is
+            # never split between columns.
+            estimated_height = 42 + (len(values) * 28)
+            category_widgets.append(
+                (estimated_height, category_widget)
+            )
+
+        # Keep four columns on normal desktop widths. If there are fewer
+        # categories, don't create empty columns.
+        column_count = min(4, max(1, len(category_widgets)))
+        columns = []
+
+        for _ in range(column_count):
+            column = QWidget()
+            column_layout = QVBoxLayout(column)
+            column_layout.setContentsMargins(0, 0, 0, 0)
+            column_layout.setSpacing(8)
+            column_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+            self.layout.addWidget(column)
+            columns.append((0, column_layout))
+
+        # Largest blocks first -> much better balancing between columns.
+        for estimated_height, category_widget in sorted(
+            category_widgets,
+            key=lambda item: item[0],
+            reverse=True,
+        ):
+            index = min(
+                range(len(columns)),
+                key=lambda i: columns[i][0]
+            )
+            current_height, column_layout = columns[index]
+            column_layout.addWidget(category_widget)
+            columns[index] = (
+                current_height + estimated_height,
+                column_layout,
+            )
+
         self._loading = False
 
     def set_baseline(self, groupings):
@@ -146,11 +196,6 @@ class TagPanel(QWidget):
 
             for value, checkbox in values.items():
 
-                # Aktualny stan checkboxa mówi wyłącznie o
-                # tym, co użytkownik właśnie wybrał.
-                #
-                # CHECKED  -> dodaj tag wszystkim
-                # UNCHECKED -> usuń tag wszystkim
                 current_state = checkbox.isChecked()
 
                 had_tag = any(
@@ -158,8 +203,6 @@ class TagPanel(QWidget):
                     for tags in before
                 )
 
-                # Jeżeli nic się nie zmieniło względem stanu,
-                # nie robimy żadnego zapisu.
                 if current_state == had_tag:
                     continue
 

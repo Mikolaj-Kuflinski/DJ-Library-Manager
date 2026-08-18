@@ -38,15 +38,23 @@
     "K-POP",
     "HOUSE",
     "RAP",
-    "REGGAE"
+    "REGGAE",
+    "Techno",
+    "D&B"
   ],
   "TEMPO": [
     "Wolne",
     "Średnie",
-    "Szybkie"
+    "Szybkie",
+    "60-90 BPM"
   ],
   "SPECIAL": [
     "Sax",
     "Podkłady"
-  ]
+  ],
+  "123": [
+    "234",
+    "456"
+  ],
+  "098": []
 }
